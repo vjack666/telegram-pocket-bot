@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Runtime and local artifacts
+runtime/
+*.log
+*.tmp
+.pocket_profile/
+
+# Local sessions / secrets
+*.session
+*.session-journal
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

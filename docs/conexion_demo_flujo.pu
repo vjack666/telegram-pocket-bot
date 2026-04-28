@@ -1,0 +1,34 @@
+@startuml
+title Telegram -> Pocket Option (Flujo Demo Seguro)
+
+actor Usuario
+participant "main.py" as Main
+participant "TelegramSignalReader" as Tg
+participant "SignalParser" as Parser
+participant "SignalEngine" as Engine
+participant "PocketOptionDemoClient" as PO
+
+Usuario -> Main: Ejecuta sistema
+Main -> Tg: Iniciar cliente Telegram
+Tg --> Main: Escuchando canales configurados
+
+loop Por cada mensaje nuevo
+  Tg -> Engine: process_text(mensaje)
+  Engine -> Parser: parse(mensaje)
+  Parser --> Engine: TradingSignal | None
+  alt señal válida
+    Engine -> PO: place_order(signal)
+    PO --> Engine: Log [DEMO] orden preparada
+  else no señal
+    Engine --> Tg: Ignorar mensaje
+  end
+end
+
+note right of PO
+Sin credenciales hardcodeadas.
+Sin orden real por defecto.
+Reemplazar por cliente real
+después de validar reglas.
+end note
+
+@enduml
