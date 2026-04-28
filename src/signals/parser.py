@@ -74,6 +74,16 @@ class SignalParser:
             r"MARTINGALA\s*(?:A\s*LAS)?\s*[:=]?\s*(\d{1,2})[:\.](\d{2})",
             re.IGNORECASE,
         )
+        # Códigos de moneda y cripto reconocidos. Cualquier par que no use
+        # exclusivamente estos códigos se descarta como falso positivo.
+        self._known_currencies = {
+            "USD", "EUR", "GBP", "AUD", "CAD", "CHF", "JPY", "NZD",
+            "SEK", "NOK", "DKK", "SGD", "HKD", "MXN", "ZAR", "TRY",
+            "RUB", "BRL", "INR", "CNH", "CNY", "PLN", "HUF", "CZK",
+            "XAU", "XAG", "XPT", "XPD",
+            "BTC", "ETH", "LTC", "XRP", "BNB", "SOL", "ADA", "DOT",
+            "USDT", "USDC",
+        }
 
     def parse(self, raw_text: str, received_at_utc: datetime | None = None) -> Optional[TradingSignal]:
         text = (raw_text or "").strip()
@@ -95,6 +105,8 @@ class SignalParser:
             return None
 
         asset = self._extract_asset(norm_text, signal_line_match)
+        if asset is None:
+            return None
         expiry_match = self._expiry_re.search(norm_text)
         amount_match = self._amount_re.search(norm_text)
         entry_time_match = self._entry_time_re.search(norm_text)
@@ -145,30 +157,40 @@ class SignalParser:
             return "BUY"
         return "SELL"
 
-    def _extract_asset(self, text: str, signal_line_match: re.Match[str] | None = None) -> str:
+    def _extract_asset(self, text: str, signal_line_match: re.Match[str] | None = None) -> str | None:
         if signal_line_match is not None:
             raw_asset = re.sub(r"\s+", " ", signal_line_match.group("asset").upper()).strip()
             return canonicalize_pocket_asset(raw_asset.replace("/", ""), default_asset="EURUSD OTC")
 
         pair_match = self._asset_pair_re.search(text)
         if pair_match:
-            raw_pair = f"{pair_match.group(1).upper()}{pair_match.group(2).upper()}"
-            if pair_match.group(3):
-                raw_pair = f"{raw_pair} OTC"
-            return canonicalize_pocket_asset(raw_pair, default_asset="EURUSD OTC")
+            c1, c2 = pair_match.group(1).upper(), pair_match.group(2).upper()
+            if c1 in self._known_currencies and c2 in self._known_currencies:
+                raw_pair = f"{c1}{c2}"
+                if pair_match.group(3):
+                    raw_pair = f"{raw_pair} OTC"
+                return canonicalize_pocket_asset(raw_pair, default_asset="EURUSD OTC")
 
         flex_match = self._asset_flex_re.search(text)
         if flex_match:
-            raw_pair = f"{flex_match.group(1).upper()}{flex_match.group(2).upper()}"
-            if flex_match.group(3):
-                raw_pair = f"{raw_pair} OTC"
-            return canonicalize_pocket_asset(raw_pair, default_asset="EURUSD OTC")
+            c1, c2 = flex_match.group(1).upper(), flex_match.group(2).upper()
+            if c1 in self._known_currencies and c2 in self._known_currencies:
+                raw_pair = f"{c1}{c2}"
+                if flex_match.group(3):
+                    raw_pair = f"{raw_pair} OTC"
+                return canonicalize_pocket_asset(raw_pair, default_asset="EURUSD OTC")
 
         asset_match = self._asset_re.search(text)
         if not asset_match:
-            return "EURUSD OTC"
+            return None
 
         raw_asset = re.sub(r"\s+", " ", asset_match.group(1).upper()).strip()
+        # Validar que el par de 6 letras esté compuesto por dos monedas conocidas
+        base = raw_asset.replace(" OTC", "").replace(" ", "")
+        if len(base) == 6:
+            c1, c2 = base[:3], base[3:]
+            if c1 not in self._known_currencies or c2 not in self._known_currencies:
+                return None
         return canonicalize_pocket_asset(raw_asset, default_asset="EURUSD OTC")
 
     @staticmethod

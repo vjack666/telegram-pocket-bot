@@ -1,5 +1,7 @@
 import asyncio
+from contextlib import suppress
 import logging
+import math
 import shutil
 import sys
 from collections import deque
@@ -8,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from src.core.models import TradingSignal
+from src.core.console_hub import clear_countdown_line, print_countdown_line
 from src.pocket_option.assets import canonicalize_pocket_asset
 from src.signals.parser import SignalParser
 from src.telegram.message_types import TelegramInboundMessage
@@ -155,6 +158,25 @@ class GlobalGaleState:
             self._accumulated_loss,
         )
     
+    def reset_for_new_signal(self, current_balance: float) -> None:
+        """Llamar al inicio de cada señal nueva.
+        - Siempre arranca en ENTRADA (step=0).
+        - Si hay pérdidas acumuladas de señales anteriores, las CONSERVA para el cálculo de montos.
+        - Solo reinicia todo al recibir un WIN.
+        """
+        if self._is_active and self._accumulated_loss > 0:
+            # Hay pérdidas previas: mantener accumulated_loss y cycle_start para el calculador,
+            # pero resetear el paso para que la nueva señal empiece en ENTRADA.
+            self._current_step = 0
+            logging.info(
+                "GlobalGaleState: Nueva señal con pérdidas acumuladas=%.2f | step=0 | target=%.2f",
+                self._accumulated_loss,
+                self.target_balance,
+            )
+        else:
+            # Sin pérdidas previas: ciclo limpio
+            self.start_new_cycle(current_balance)
+
     def record_win(self) -> None:
         """Reset gale state after a WIN."""
         logging.info(
@@ -199,7 +221,6 @@ class SignalProcessor:
         # Ventana dura de seguridad para evitar ejecutar señales inviables.
         self._max_early_signal_seconds = 300.0
         self._hard_late_signal_seconds = min(10.0, float(self._late_tolerance_seconds))
-        self._heartbeat_inline_visible = False
         self._event_recorder = event_recorder
 
     async def enqueue_message(self, envelope: TelegramInboundMessage) -> None:
@@ -211,16 +232,8 @@ class SignalProcessor:
         ]
 
     async def _process_loop(self) -> None:
-        _HEARTBEAT_SECONDS = 30
         while True:
-            try:
-                envelope = await asyncio.wait_for(
-                    self._message_queue.get(), timeout=_HEARTBEAT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                self._render_idle_heartbeat()
-                continue
-            self._clear_idle_heartbeat()
+            envelope = await self._message_queue.get()
             try:
                 await self._process_envelope(envelope)
             except Exception as exc:
@@ -287,9 +300,16 @@ class SignalProcessor:
             item = await queue.get()
 
             channel_name = item.envelope.source_name or str(chat_id)
+            countdown_task: asyncio.Task | None = None
             try:
                 now_utc = datetime.now(timezone.utc)
                 execute_at = item.signal.execute_at_utc or now_utc
+
+                # Solo visual: contador en paralelo, sin alterar la estrategia de espera.
+                countdown_task = asyncio.create_task(
+                    self._render_entry_countdown(item, execute_at),
+                    name=f"entry-countdown-{chat_id}",
+                )
 
                 # Buffer para preparar contexto antes del segundo exacto.
                 buffer_seconds = 2.0
@@ -318,7 +338,40 @@ class SignalProcessor:
                 )
                 await self._run_signal_task(item)
             finally:
+                if countdown_task is not None:
+                    countdown_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await countdown_task
+                    clear_countdown_line()
                 queue.task_done()
+
+    async def _render_entry_countdown(self, item: QueuedSignal, execute_at: datetime) -> None:
+        buffer_seconds = 2.0
+
+        while True:
+            now_utc = datetime.now(timezone.utc)
+            remaining = (execute_at - now_utc).total_seconds()
+            if remaining <= 0:
+                return
+
+            total_seconds = max(0, int(math.ceil(remaining)))
+            hh = total_seconds // 3600
+            mm = (total_seconds % 3600) // 60
+            ss = total_seconds % 60
+            semaphore = "AMARILLO PREP" if remaining <= buffer_seconds else "ROJO ESPERA"
+
+            print_countdown_line(
+                step_name="ENTRADA",
+                asset=item.signal.asset,
+                side=item.signal.side,
+                amount=item.signal.amount,
+                hh=hh,
+                mm=mm,
+                ss=ss,
+                semaphore=semaphore,
+            )
+
+            await asyncio.sleep(min(1.0, max(0.1, remaining)))
 
     async def _run_signal_task(self, item: QueuedSignal) -> None:
         self._state_manager.inc_active()
@@ -512,32 +565,6 @@ class SignalProcessor:
             delay,
             action,
         )
-
-    def _render_idle_heartbeat(self) -> None:
-        if not sys.stdout.isatty():
-            logging.info(
-                "[PIPELINE] Esperando mensajes... (cola=%d activas=%d)",
-                self._message_queue.qsize(),
-                self._state_manager.active_count,
-            )
-            return
-
-        width = max(80, shutil.get_terminal_size((120, 24)).columns)
-        text = (
-            f"[PIPELINE] Esperando mensajes... "
-            f"(cola={self._message_queue.qsize()} activas={self._state_manager.active_count})"
-        )
-        padded = text[: max(0, width - 1)].ljust(max(0, width - 1))
-        print("\r" + padded, end="", flush=True)
-        self._heartbeat_inline_visible = True
-
-    def _clear_idle_heartbeat(self) -> None:
-        if not self._heartbeat_inline_visible:
-            return
-        if sys.stdout.isatty():
-            width = max(80, shutil.get_terminal_size((120, 24)).columns)
-            print("\r" + (" " * max(0, width - 1)) + "\r", end="", flush=True)
-        self._heartbeat_inline_visible = False
 
     def _emit_event(self, event: str, **fields: Any) -> None:
         if self._event_recorder is None:

@@ -41,6 +41,7 @@ class SignalEngine:
         self._hard_late_execution_seconds = min(10.0, float(self._signal_late_tolerance_seconds))
         self._martingale_prepare_lead_seconds = 10.0
         self._martingale_send_lead_seconds = 0.2
+        self._max_entry_delay_seconds = 1.0
         self._global_gale = global_gale_state
         self._event_recorder = event_recorder
         # CRITICAL FIX: Broker-level lock to serialize all browser operations
@@ -51,24 +52,17 @@ class SignalEngine:
 
     async def _run_martingale_flow(self, signal: TradingSignal) -> None:
         before_cycle_balance = await self._safe_get_balance()
-        
-        # Determinar si continuamos un gale existente o empezamos nuevo ciclo
-        if self._global_gale.is_active:
-            start_step = self._global_gale.current_step
-            logging.info(
-                "Continuando gale global desde step=%d (cambio de par permitido) | balance_actual=%.2f target=%.2f",
-                start_step,
-                before_cycle_balance,
-                self._global_gale.target_balance,
-            )
-        else:
-            start_step = 0
-            self._global_gale.start_new_cycle(before_cycle_balance)
-            logging.info(
-                "Iniciando nuevo ciclo gale global | balance=%.2f target=%.2f",
-                before_cycle_balance,
-                self._global_gale.target_balance,
-            )
+        start_step = 0
+
+        # Toda señal nueva entra por ENTRADA (step=0).
+        # Si hay pérdidas acumuladas de señales anteriores, se conservan para el cálculo de montos.
+        self._global_gale.reset_for_new_signal(before_cycle_balance)
+        logging.info(
+            "Nueva señal inicia en ENTRADA (step=0) | balance=%.2f accumulated_loss=%.2f target=%.2f",
+            before_cycle_balance,
+            self._global_gale.accumulated_loss,
+            self._global_gale.target_balance,
+        )
         
         cycle_amounts = self._build_cycle_amounts(before_cycle_balance)
         entry_times = self._build_schedule(signal, len(cycle_amounts))
@@ -227,7 +221,7 @@ class SignalEngine:
         # This applies to ALL steps (ENTRADA and MARTINGALAS)
         now_utc = datetime.now(timezone.utc)
         delay_from_entry = (now_utc - entry_at).total_seconds()
-        max_entry_delay = 10.0  # Max 10 seconds past entry time
+        max_entry_delay = self._max_entry_delay_seconds
         if delay_from_entry > max_entry_delay:
             logging.error(
                 "%s cancelada: entrada ya vencida (%.1f segundos pasados, máx=%.1f). Ignorar.",
@@ -323,7 +317,7 @@ class SignalEngine:
     ) -> tuple[float, float | None, datetime] | None:
         next_step_name = f"MARTINGALA {next_step_idx}"
         next_prepared = False
-        prepare_lead_seconds = self._martingale_prepare_lead_seconds
+        prepare_lead_seconds = max(self._martingale_prepare_lead_seconds, 20.0)
         last_monitor_second: int | None = None
 
         while True:
@@ -395,6 +389,15 @@ class SignalEngine:
         # Registrar LOSS en el estado global antes de continuar al siguiente paso
         self._global_gale.record_loss(current_amount)
         try:
+            if next_prepared:
+                return await self._click_prepared_step_immediate(
+                    next_step_name,
+                    signal,
+                    next_entry_at,
+                    next_amount,
+                )
+
+            # Fallback: si por alguna razón no se alcanzó a prearmar, usar flujo completo.
             return await self._prepare_and_click_step(
                 next_step_name,
                 signal,
@@ -404,6 +407,70 @@ class SignalEngine:
         except RuntimeError as exc:
             logging.warning("%s cancelada tras LOSS previo: %s", next_step_name, exc)
             return None
+
+    async def _click_prepared_step_immediate(
+        self,
+        step_name: str,
+        signal: TradingSignal,
+        entry_at: datetime,
+        amount: float,
+    ) -> tuple[float, float | None, datetime]:
+        """Ejecuta un paso YA prearmado sin re-preparar ni revalidar activo."""
+        before_balance = await self._safe_get_balance()
+        entry_price = await self._safe_get_live_price(signal.asset)
+
+        logging.info(
+            "%s CLICK INMEDIATO (prearmada): %s %s amount=%.2f entry_price=%s",
+            step_name,
+            signal.asset,
+            signal.side,
+            amount,
+            f"{entry_price:.5f}" if entry_price is not None else "n/d",
+        )
+
+        async with self._broker_lock:
+            try:
+                await self._pocket_client.execute_order_click(signal.side)
+            except Exception as exc:
+                logging.exception(
+                    "Fallo click inmediato [%s] %s %s: %s",
+                    step_name,
+                    signal.asset,
+                    signal.side,
+                    exc,
+                )
+                print_order_event(
+                    "error",
+                    step_name,
+                    signal.asset,
+                    signal.side,
+                    amount,
+                    extra=str(exc),
+                    color_output=self._color_output,
+                )
+                raise
+
+        click_at = datetime.now(timezone.utc)
+        logging.info("%s ejecutada (prearmada): %s %s amount=%.2f", step_name, signal.asset, signal.side, amount)
+        self._emit_event(
+            "trade_step_executed",
+            asset=signal.asset,
+            side=signal.side,
+            step_name=step_name,
+            amount=amount,
+            click_at=click_at.isoformat(),
+            entry_at=entry_at.isoformat(),
+            source_name=signal.source_name or "",
+        )
+        print_order_event(
+            "executed",
+            step_name,
+            signal.asset,
+            signal.side,
+            amount,
+            color_output=self._color_output,
+        )
+        return before_balance, entry_price, click_at
 
     def _build_schedule(self, signal: TradingSignal, count: int) -> list[datetime]:
         now_utc = datetime.now(timezone.utc)
@@ -478,12 +545,17 @@ class SignalEngine:
 
         # Señal en ventana inmediata: puede no haber pasado por _run_countdown_and_prepare.
         # Forzamos preparación rápida para no clickear con el activo/monto anterior.
+        from src.core.console_hub import print_countdown_line, clear_countdown_line
+        print_countdown_line(
+            step_name=step_name,
+            asset=signal.asset,
+            side=signal.side,
+            amount=amount,
+            hh=0, mm=0, ss=0,
+            semaphore="VERDE LISTO",
+            color_output=self._color_output,
+        )
         try:
-            logging.info(
-                "%s en ventana inmediata (delay=%.3fs). Preparacion rapida antes del click.",
-                step_name,
-                delay,
-            )
             await self._pocket_client.prepare_order_for_execution(
                 signal.asset,
                 amount,
@@ -491,6 +563,7 @@ class SignalEngine:
                 max_retries=2,
             )
         except Exception as exc:
+            clear_countdown_line()
             logging.warning(
                 "%s cancelada: no se pudo preparar orden en ventana inmediata: %s",
                 step_name,
@@ -599,102 +672,65 @@ class SignalEngine:
         side: str,
         entry_delay: float = 0.0,
     ) -> bool | None:
-        """Monitorea el resultado de una operación usando DOS CAPAS:
-        
-        CAPA 1 (DOM): Si entry_delay < 3s y snapshot es WINNING/LOSING → confiar en DOM
-        CAPA 2 (BALANCE): Si entry_delay > 3s O DOM es NEUTRAL → usar balance como verdad absoluta
-        
+        """Espera 1 segundo después del cierre y detecta WIN/LOSS por balance.
+
         Retorna True (WIN), False (LOSS) o None (resultado desconocido).
         """
-        poll_seconds = 0.5
-        settle_guard_seconds = 2.0
-        deadline = close_at + timedelta(seconds=self._result_grace_seconds)
-        use_dom_only_threshold = 3.0  # Si delay > 3s, ignorar DOM y usar SOLO balance
-        
+        # Esperar exactamente 1 segundo después del cierre de la operación
+        wait_until = close_at + timedelta(seconds=1.0)
+        now_utc = datetime.now(timezone.utc)
+        remaining = (wait_until - now_utc).total_seconds()
+
         logging.info(
-            "Monitoreando resultado (HÍBRIDO) asset=%s side=%s close_at=%s delay=%.1fs "
-            "(DOM si delay<3s, BALANCE como verdad absoluta)",
+            "Esperando cierre: asset=%s side=%s close_at=%s (%.1fs restantes) delay=%.1fs",
             asset,
             side,
             close_at.isoformat(),
+            max(0.0, remaining),
             entry_delay,
         )
 
-        # ════════════════════════════════════════════════════════════════════
-        # INTENTO 1: Esperar al settle_guard y leer DOM
-        # ════════════════════════════════════════════════════════════════════
-        deadline_dom = close_at + timedelta(seconds=settle_guard_seconds)
-        while True:
-            now_utc = datetime.now(timezone.utc)
-            if now_utc >= deadline_dom:
-                break
-            await asyncio.sleep(poll_seconds)
-
-        # Leer DOM una vez alcanzado settle_guard
-        snapshot = await self._safe_get_live_trade_snapshot(asset, side)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
         
         # ════════════════════════════════════════════════════════════════════
         # DECISIÓN: ¿Confiar en DOM o usar BALANCE?
         # ════════════════════════════════════════════════════════════════════
         
-        # CASO 1: entry_delay < 3s Y DOM confirma WINNING/LOSING → usar DOM
-        if entry_delay < use_dom_only_threshold and snapshot is not None and snapshot.status in {"WINNING", "LOSING"}:
-            logging.info(
-                "✓ CAPA 1 (DOM): Resultado confirmado rápido. "
-                "asset=%s status=%s pnl=%.5f open=%s close=%s",
-                asset,
-                snapshot.status,
-                snapshot.pnl_value,
-                f"{snapshot.open_price:.5f}" if snapshot.open_price is not None else "n/d",
-                f"{snapshot.close_price:.5f}" if snapshot.close_price is not None else "n/d",
-            )
-            return snapshot.status == "WINNING"
-        
-        # CASO 2: entry_delay > 3s O DOM no confirmó → usar BALANCE como verdad absoluta
-        logging.info(
-            "→ CAPA 2 (BALANCE): Usando balance como verdad absoluta (delay=%.1fs, snapshot=%s)",
-            entry_delay,
-            f"{snapshot.status}" if snapshot is not None else "None",
-        )
-        
-        # Esperar 0.5s extra para que el broker actualice balance
-        await asyncio.sleep(0.5)
-        
+        # Leer balance 1 segundo después del cierre
         try:
             after_balance = await self._safe_get_balance()
             diff = after_balance - before_balance
-            
+
             logging.info(
-                "Balance: antes=%.2f después=%.2f diff=%.2f (threshold=±0.01)",
+                "Resultado por balance: asset=%s antes=%.2f después=%.2f diff=%.2f",
+                asset,
                 before_balance,
                 after_balance,
                 diff,
             )
-            
+
             # Threshold mínimo para evitar ruido de fees o timing impreciso
-            loss_threshold = -0.01
-            win_threshold = 0.01
-            
-            if diff < loss_threshold:
-                logging.info("✓ LOSS detectado por BALANCE (diff=%.2f < %.2f)", diff, loss_threshold)
-                return False  # LOSS
-            elif diff > win_threshold:
-                logging.info("✓ WIN detectado por BALANCE (diff=%.2f > %.2f)", diff, win_threshold)
-                return True  # WIN
+            if diff < -0.01:
+                logging.info("✓ LOSS (balance diff=%.2f)", diff)
+                return False
+            elif diff > 0.01:
+                logging.info("✓ WIN (balance diff=%.2f)", diff)
+                return True
             else:
                 logging.warning(
-                    "Balance sin cambio significativo (diff=%.2f en rango ±%.2f) — resultado DESCONOCIDO",
+                    "Balance sin cambio significativo (diff=%.2f) — resultado DESCONOCIDO. "
+                    "No se ejecutará martingala.",
                     diff,
-                    win_threshold,
                 )
-                return None  # Sin cambio = sin resultado confirmado
-                
+                return None
+
         except Exception as exc:
-            logging.error("No se pudo leer balance para CAPA 2: %s", exc)
-            logging.warning(
-                "Resultado DESCONOCIDO para %s %s — CAPA 2 (balance) falló. No se ejecutará martingala.",
+            logging.error(
+                "No se pudo leer balance para detectar resultado de %s %s: %s",
                 asset,
                 side,
+                exc,
             )
             return None
 
@@ -761,18 +797,6 @@ class SignalEngine:
                 break
 
             if remaining <= prepare_lead_seconds and not preparation_done:
-                logging.info(
-                    "═══ %s: PREPARANDO ORDEN (quedan %.1fs, envio dinamico=%.1fs) ═══",
-                    step_name,
-                    remaining,
-                    send_lead_seconds,
-                )
-                logging.info(
-                    "    Asset: %s | Monto: $%.2f | Side: %s",
-                    signal.asset,
-                    amount,
-                    signal.side,
-                )
                 try:
                     await self._pocket_client.prepare_order_for_execution(
                         signal.asset,
@@ -781,9 +805,8 @@ class SignalEngine:
                         max_retries=3,
                     )
                     preparation_done = True
-                    logging.info("✓ %s: ORDEN PREPARADA (asset + monto listos para clickear)", step_name)
                 except Exception as exc:
-                    logging.warning("✗ %s: Fallo preparación (reintentaremos): %s", step_name, exc)
+                    logging.debug("Fallo preparación en countdown %s: %s", step_name, exc)
 
             remaining_int = max(0, int(remaining))
             mins, sec = divmod(remaining_int, 60)
