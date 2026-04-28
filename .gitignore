@@ -23,6 +23,7 @@ runtime/
 # Local sessions / secrets
 *.session
 *.session-journal
+.env
 
 # OS / editor
 .DS_Store
