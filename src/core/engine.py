@@ -39,9 +39,10 @@ class SignalEngine:
         self._color_output = color_output
         self._signal_late_tolerance_seconds = max(0, signal_late_tolerance_seconds)
         self._hard_late_execution_seconds = min(10.0, float(self._signal_late_tolerance_seconds))
-        self._martingale_prepare_lead_seconds = 10.0
+        self._martingale_prepare_lead_seconds = 30.0
         self._martingale_send_lead_seconds = 0.2
-        self._max_entry_delay_seconds = 1.0
+        self._max_entry_delay_seconds = 10.0
+        self._max_operation_balance_ratio = 0.10
         self._global_gale = global_gale_state
         self._event_recorder = event_recorder
         # CRITICAL FIX: Broker-level lock to serialize all browser operations
@@ -543,6 +544,13 @@ class SignalEngine:
             )
             return False
 
+        if delay < 0:
+            logging.info(
+                "%s en atraso controlado (%.1fs) dentro de tolerancia. Continuando con ejecucion inmediata.",
+                step_name,
+                abs(delay),
+            )
+
         # Señal en ventana inmediata: puede no haber pasado por _run_countdown_and_prepare.
         # Forzamos preparación rápida para no clickear con el activo/monto anterior.
         from src.core.console_hub import print_countdown_line, clear_countdown_line
@@ -868,13 +876,30 @@ class SignalEngine:
         
         losses = 0
         amounts: list[float] = []
+        # Tope fijo por señal: no gastar más del 10% de la cuenta por operación.
+        risk_cap = round(max(0.01, start_balance * self._max_operation_balance_ratio), 2)
+        cap_reached = False
 
         for _ in range(self._calc_max_steps):
-            needed_profit = max(0.0, target - balance)
-            amount = needed_profit / self._calc_payout
-            if amount <= 0:
-                amount = 0.01
-            amounts.append(round(amount, 2))
+            if cap_reached:
+                amount = risk_cap
+            else:
+                needed_profit = max(0.0, target - balance)
+                amount = needed_profit / self._calc_payout
+                if amount <= 0:
+                    amount = 0.01
+                amount = round(max(0.01, amount), 2)
+
+                if amount > risk_cap:
+                    logging.info(
+                        "Regla 10%% aplicada: monto_calculado=%.2f tope_fijo=%.2f. Se mantiene monto plano.",
+                        amount,
+                        risk_cap,
+                    )
+                    amount = risk_cap
+                    cap_reached = True
+
+            amounts.append(amount)
 
             balance = max(0.0, balance - amount)
             losses += 1

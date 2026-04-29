@@ -1,9 +1,14 @@
 import asyncio
+import inspect
 import logging
+import re
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Dict, Iterable
+from typing import Any, Awaitable, Callable, Dict, Iterable, cast
 
 from telethon import TelegramClient, events
+from telethon.errors import InviteHashExpiredError, InviteHashInvalidError, UserAlreadyParticipantError
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+from telethon.utils import get_peer_id
 from src.telegram.message_types import TelegramInboundMessage
 
 
@@ -13,6 +18,7 @@ MessageHandler = Callable[[TelegramInboundMessage], Awaitable[None]]
 _KEEP_ALIVE_INTERVAL = 60
 # Tiempo máximo de espera entre reintentos de reconexión (segundos)
 _MAX_RETRY_SECONDS = 30
+_INVITE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", re.IGNORECASE)
 
 
 class TelegramSignalReader:
@@ -20,7 +26,7 @@ class TelegramSignalReader:
     Cliente Telegram persistente con reconexión automática blindada.
 
     El TelegramClient se crea UNA SOLA VEZ en __init__ con auto_reconnect=True
-    y connection_retries=None (reintentos infinitos). Nunca se recrea el cliente.
+    y un numero muy alto de reintentos. Nunca se recrea el cliente.
 
     Cuando la conexión cae (VPN, corte de red, etc.) el método `run()` detecta
     el error, espera y llama de nuevo a `run_until_disconnected()` sobre el
@@ -48,7 +54,7 @@ class TelegramSignalReader:
             api_id,
             api_hash,
             auto_reconnect=True,
-            connection_retries=None,  # infinito
+            connection_retries=10**9,
             retry_delay=3,
         )
         self._backfill_minutes = max(0.0, float(backfill_minutes))
@@ -57,12 +63,53 @@ class TelegramSignalReader:
         self._channel_names: Dict[str, str] = channel_names or {}
         # chat_id (int) -> display name resuelto en tiempo de ejecución
         self._id_to_name: Dict[int, str] = {}
+        # Tareas de despacho al pipeline para no bloquear el handler de Telethon
+        self._dispatch_tasks: set[asyncio.Task] = set()
         # Handlers registrados (solo se registran una vez)
         self._handlers_registered = False
 
     # ------------------------------------------------------------------
     # API pública principal
     # ------------------------------------------------------------------
+
+    async def _await_if_needed(self, result: Any) -> Any:
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def _run_until_disconnected(self) -> None:
+        await self._await_if_needed(self._client.run_until_disconnected())
+
+    async def _disconnect_with_timeout(self, timeout_seconds: float) -> None:
+        result = self._client.disconnect()
+        if inspect.isawaitable(result):
+            await asyncio.wait_for(result, timeout=timeout_seconds)
+
+    async def _dispatch_message(self, on_message: MessageHandler, envelope: TelegramInboundMessage) -> None:
+        await on_message(envelope)
+
+    def _schedule_dispatch(self, on_message: MessageHandler, envelope: TelegramInboundMessage) -> None:
+        task = asyncio.create_task(
+            self._dispatch_message(on_message, envelope),
+            name=f"telegram-dispatch-{envelope.chat_id}-{envelope.message_id}",
+        )
+        self._dispatch_tasks.add(task)
+
+        def _done_callback(done_task: asyncio.Task) -> None:
+            self._dispatch_tasks.discard(done_task)
+            try:
+                exc = done_task.exception()
+                if exc is not None:
+                    logging.exception(
+                        "Fallo despachando mensaje Telegram chat_id=%s msg_id=%s",
+                        envelope.chat_id,
+                        envelope.message_id,
+                        exc_info=exc,
+                    )
+            except asyncio.CancelledError:
+                pass
+
+        task.add_done_callback(_done_callback)
 
     async def run(
         self,
@@ -74,7 +121,11 @@ class TelegramSignalReader:
         Loop blindado de reconexión. Llama a este método desde main.py
         en lugar del antiguo start(). No recrea el cliente en ningún momento.
         """
-        await self._client.start()
+        await self._client.connect()
+        if not await self._client.is_user_authorized():
+            raise RuntimeError(
+                "Sesion Telegram no autorizada. Reautentica TELEGRAM_SESSION_NAME antes de iniciar."
+            )
 
         resolved_chats = await self._resolve_source_chats()
         if not resolved_chats:
@@ -108,7 +159,7 @@ class TelegramSignalReader:
 
                     # Ejecutar run_until_disconnected con soporte para shutdown rápido
                     run_task = asyncio.create_task(
-                        self._client.run_until_disconnected(),
+                        self._run_until_disconnected(),
                         name="telegram-run-until-disconnected"
                     )
                     shutdown_wait_task = asyncio.create_task(
@@ -127,7 +178,7 @@ class TelegramSignalReader:
                         logging.info("Telegram: shutdown detectado, desconectando cliente...")
                         if self._client.is_connected():
                             try:
-                                await asyncio.wait_for(self._client.disconnect(), timeout=2.0)
+                                await self._disconnect_with_timeout(timeout_seconds=2.0)
                             except Exception as exc:
                                 logging.debug("Error desconectando en shutdown: %s", exc)
                     
@@ -184,12 +235,17 @@ class TelegramSignalReader:
         finally:
             keep_alive_task.cancel()
             await asyncio.gather(keep_alive_task, return_exceptions=True)
+            if self._dispatch_tasks:
+                for task in list(self._dispatch_tasks):
+                    task.cancel()
+                await asyncio.gather(*self._dispatch_tasks, return_exceptions=True)
+                self._dispatch_tasks.clear()
 
     async def disconnect(self) -> None:
         """Desconectar limpiamente el cliente."""
         try:
             # Intentar desconexión con timeout para no bloquear el cierre
-            await asyncio.wait_for(self._client.disconnect(), timeout=3.0)
+            await self._disconnect_with_timeout(timeout_seconds=3.0)
             logging.info("Telegram: desconectado limpiamente")
         except asyncio.TimeoutError:
             logging.warning("Telegram: timeout en disconnect (3s), continuando cierre...")
@@ -202,7 +258,11 @@ class TelegramSignalReader:
 
     async def start(self, on_message: MessageHandler) -> None:
         """Deprecated: usar run() con shutdown_event para reconexión blindada."""
-        await self._client.start()
+        await self._client.connect()
+        if not await self._client.is_user_authorized():
+            raise RuntimeError(
+                "Sesion Telegram no autorizada. Reautentica TELEGRAM_SESSION_NAME antes de iniciar."
+            )
         resolved_chats = await self._resolve_source_chats()
         if not resolved_chats:
             raise RuntimeError(
@@ -219,7 +279,7 @@ class TelegramSignalReader:
         if self._backfill_minutes > 0:
             asyncio.create_task(self._process_recent_messages(on_message, resolved_chats))
 
-        await self._client.run_until_disconnected()
+        await self._run_until_disconnected()
 
     # ------------------------------------------------------------------
     # Internals
@@ -228,7 +288,7 @@ class TelegramSignalReader:
     def _register_handler(
         self,
         on_message: MessageHandler,
-        resolved_chats: list,
+        resolved_chats: list[Any],
     ) -> None:
         @self._client.on(events.NewMessage(chats=resolved_chats))
         async def _handler(event: events.NewMessage.Event) -> None:
@@ -238,12 +298,15 @@ class TelegramSignalReader:
 
             chat_id = event.chat_id or 0
             source_name = self._id_to_name.get(chat_id, "")
+            now_utc = datetime.now(timezone.utc)
+            ingress_lag = (now_utc - event.date.astimezone(timezone.utc)).total_seconds()
             logging.info(
-                "Telegram IN canal='%s' chat_id=%s msg_id=%s chars=%s",
+                "Telegram IN canal='%s' chat_id=%s msg_id=%s chars=%s lag_in=%.3fs",
                 source_name or str(chat_id),
                 chat_id,
                 event.id,
                 len(text),
+                ingress_lag,
             )
             envelope = TelegramInboundMessage(
                 chat_id=chat_id,
@@ -252,7 +315,7 @@ class TelegramSignalReader:
                 message_date_utc=event.date.astimezone(timezone.utc),
                 source_name=source_name,
             )
-            await on_message(envelope)
+            self._schedule_dispatch(on_message, envelope)
 
         logging.info("Telegram: handler de mensajes registrado")
 
@@ -274,7 +337,7 @@ class TelegramSignalReader:
     async def _process_recent_messages(
         self,
         on_message: MessageHandler,
-        resolved_chats: Iterable[object],
+        resolved_chats: Iterable[Any],
     ) -> None:
         if self._backfill_minutes <= 0:
             return
@@ -307,7 +370,7 @@ class TelegramSignalReader:
                 )
 
             for envelope in reversed(messages):
-                await on_message(envelope)
+                self._schedule_dispatch(on_message, envelope)
                 recovered += 1
 
             if recovered:
@@ -317,8 +380,8 @@ class TelegramSignalReader:
                     getattr(entity, "title", None) or getattr(entity, "id", "chat"),
                 )
 
-    async def _resolve_source_chats(self) -> list[object]:
-        resolved: list[object] = []
+    async def _resolve_source_chats(self) -> list[Any]:
+        resolved: list[Any] = []
 
         for raw in self._source_chats:
             chat = (raw or "").strip()
@@ -330,6 +393,9 @@ class TelegramSignalReader:
                 entity = await self._client.get_entity(chat)
             except Exception:
                 pass
+
+            if entity is None:
+                entity = await self._resolve_invite_link(chat)
 
             if entity is None:
                 normalized_phone = _normalize_phone(chat)
@@ -349,6 +415,20 @@ class TelegramSignalReader:
 
             resolved.append(entity)
 
+            try:
+                input_peer = await self._client.get_input_entity(cast(Any, entity))
+                resolved[-1] = input_peer
+                input_peer_id = get_peer_id(input_peer)
+            except Exception as exc:
+                # Keep the original entity as fallback; Telethon may still accept it.
+                input_peer_id = 0
+                logging.warning(
+                    "No se pudo canonizar peer para '%s' (%s): %s",
+                    chat,
+                    type(entity).__name__,
+                    exc,
+                )
+
             # Mapear chat_id -> nombre de canal (para source_name en envelopes)
             entity_id: int = getattr(entity, "id", 0)
             if entity_id:
@@ -362,11 +442,57 @@ class TelegramSignalReader:
                         or chat
                     )
                 self._id_to_name[entity_id] = display
+                if input_peer_id:
+                    self._id_to_name[input_peer_id] = display
                 logging.info("Canal registrado: id=%s nombre='%s'", entity_id, display)
+                logging.info(
+                    "Canal filtro NewMessage: source='%s' entity_type=%s input_peer_id=%s",
+                    chat,
+                    type(entity).__name__,
+                    input_peer_id or "n/a",
+                )
 
         return resolved
 
-    async def _find_dialog_by_phone(self, phone: str) -> object | None:
+    async def _resolve_invite_link(self, chat: str) -> object | None:
+        invite_hash = _extract_invite_hash(chat)
+        if not invite_hash:
+            return None
+
+        try:
+            invite = await self._client(CheckChatInviteRequest(invite_hash))
+            chat_entity = getattr(invite, "chat", None)
+            if chat_entity is not None:
+                logging.info(
+                    "Chat privado resuelto por invitacion: id=%s titulo='%s'",
+                    getattr(chat_entity, "id", 0),
+                    getattr(chat_entity, "title", None) or getattr(chat_entity, "username", None) or chat,
+                )
+                return chat_entity
+
+            updates = await self._client(ImportChatInviteRequest(invite_hash))
+            chats = getattr(updates, "chats", None) or []
+            if chats:
+                chat_entity = chats[0]
+                logging.info(
+                    "Chat privado unido por invitacion: id=%s titulo='%s'",
+                    getattr(chat_entity, "id", 0),
+                    getattr(chat_entity, "title", None) or getattr(chat_entity, "username", None) or chat,
+                )
+                return chat_entity
+        except UserAlreadyParticipantError:
+            invite = await self._client(CheckChatInviteRequest(invite_hash))
+            chat_entity = getattr(invite, "chat", None)
+            if chat_entity is not None:
+                return chat_entity
+        except (InviteHashExpiredError, InviteHashInvalidError) as exc:
+            logging.warning("Invite link invalido/expirado para chat %s: %s", chat, exc)
+        except Exception as exc:
+            logging.warning("No se pudo resolver invitacion privada %s: %s", chat, exc)
+
+        return None
+
+    async def _find_dialog_by_phone(self, phone: str) -> Any | None:
         async for dialog in self._client.iter_dialogs():
             entity = dialog.entity
             entity_phone = _normalize_phone(getattr(entity, "phone", ""))
@@ -380,3 +506,18 @@ def _normalize_phone(value: str) -> str:
     if not digits:
         return ""
     return digits
+
+
+def _extract_invite_hash(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+
+    match = _INVITE_LINK_RE.search(text)
+    if match:
+        return match.group(1)
+
+    if text.startswith("+") and len(text) > 1:
+        return text[1:]
+
+    return ""

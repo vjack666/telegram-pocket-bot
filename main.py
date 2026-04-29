@@ -46,7 +46,7 @@ def _build_shutdown_snapshot() -> ShutdownSnapshot:
 
 _blackbox = DeferredBlackBoxRecorder(
     base_dir="runtime/blackbox",
-    max_events=200,
+    max_events=50000,
     shutdown_snapshot=_build_shutdown_snapshot,
 )
 
@@ -58,6 +58,7 @@ _run_phase = "initializing"
 _run_started_monotonic = time.monotonic()
 _RUNTIME_LOCK_PATH = Path("runtime") / "main.lock"
 _BLACKBOX_LOG_HANDLER_ATTACHED = False
+_BLACKBOX_LOG_MAX_MESSAGE_CHARS = 20000
 
 
 class _BlackBoxLogHandler(logging.Handler):
@@ -69,8 +70,8 @@ class _BlackBoxLogHandler(logging.Handler):
             return
         try:
             message = record.getMessage()
-            if len(message) > 2000:
-                message = message[:2000] + "..."
+            if len(message) > _BLACKBOX_LOG_MAX_MESSAGE_CHARS:
+                message = message[:_BLACKBOX_LOG_MAX_MESSAGE_CHARS] + "..."
             _blackbox.record(
                 "log",
                 component=record.name or "root",
@@ -242,6 +243,19 @@ async def run() -> None:
             signal_tz_offset_hours=settings.expected_utc_offset_hours,
             signal_timezone=settings.signal_timezone,
         )
+
+        def _on_signal_processor_fatal_error(reason: str) -> None:
+            if shutdown_event.is_set():
+                return
+            logging.error("SignalProcessor fatal: %s", reason)
+            _set_shutdown_reason("internal_error", "signal_processor", last_exception=reason)
+            _blackbox.record(
+                "signal_processor_fatal_error",
+                component="signal_processor",
+                reason=reason,
+            )
+            shutdown_event.set()
+
         engine = SignalEngine(
             pocket_client=pocket_client,
             martingale_amounts=settings.martingale_amounts,
@@ -269,6 +283,7 @@ async def run() -> None:
             override_asset=settings.override_asset,
             override_side=settings.override_side,
             event_recorder=_blackbox.record,
+            fatal_error_handler=_on_signal_processor_fatal_error,
         )
         worker_tasks = processor.start()
         _blackbox.record("worker_tasks_started", component="signal_processor", count=len(worker_tasks))
@@ -820,6 +835,29 @@ if __name__ == "__main__":
         finally:
             if not summary_emitted:
                 _emit_final_shutdown_summary()
+
+        if not should_restart and _shutdown_diag.reason in {"internal_error", "cancelled_error"}:
+            restart_attempts += 1
+            if restart_attempts <= MAX_MAIN_RESTARTS:
+                logging.warning(
+                    "Reinicio automatico por error (%s). intento=%s/%s",
+                    _shutdown_diag.reason,
+                    restart_attempts,
+                    MAX_MAIN_RESTARTS,
+                )
+                _blackbox.record(
+                    "auto_restart_on_error",
+                    component="main",
+                    reason=_shutdown_diag.reason,
+                    restart_attempt=restart_attempts,
+                    max_restarts=MAX_MAIN_RESTARTS,
+                )
+                should_restart = True
+            else:
+                logging.error(
+                    "Se alcanzo el maximo de reinicios por error (%s).",
+                    MAX_MAIN_RESTARTS,
+                )
 
         if should_restart:
             continue
