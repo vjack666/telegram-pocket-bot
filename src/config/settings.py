@@ -15,6 +15,7 @@ class AppSettings:
     telegram_backfill_minutes: float
     telegram_backfill_limit: int
     telegram_realtime_only: bool
+    telegram_restart_after_signal: bool
     single_asset_mode: bool
     martingale_amounts: List[float]
     martingale_mode: str
@@ -84,6 +85,9 @@ class AppSettings:
             ),
             telegram_backfill_limit=int(os.getenv("TELEGRAM_BACKFILL_LIMIT", "40")),
             telegram_realtime_only=_to_bool(os.getenv("APP_TELEGRAM_REALTIME_ONLY", "false")),
+            telegram_restart_after_signal=_to_bool(
+                os.getenv("APP_TELEGRAM_RESTART_AFTER_SIGNAL", "false")
+            ),
             single_asset_mode=_to_bool(os.getenv("APP_SINGLE_ASSET_MODE", "false")),
             martingale_amounts=_csv_float_list(
                 os.getenv("APP_MARTINGALE_AMOUNTS", "2,4,10"),
