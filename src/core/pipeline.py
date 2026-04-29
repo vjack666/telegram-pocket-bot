@@ -1,7 +1,5 @@
 import asyncio
-from contextlib import suppress
 import logging
-import math
 import shutil
 import sys
 from collections import deque
@@ -10,7 +8,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from src.core.models import TradingSignal
-from src.core.console_hub import clear_countdown_line, print_countdown_line
 from src.pocket_option.assets import canonicalize_pocket_asset
 from src.signals.parser import SignalParser
 from src.telegram.message_types import TelegramInboundMessage
@@ -369,82 +366,19 @@ class SignalProcessor:
             item = await queue.get()
 
             channel_name = item.envelope.source_name or str(chat_id)
-            countdown_task: asyncio.Task | None = None
             try:
                 my_rank = self._channel_priority.get(chat_id, 99)
                 await self._wait_for_priority_turn(chat_id, my_rank)
 
                 async with self._execution_lock:
-                    now_utc = datetime.now(timezone.utc)
-                    execute_at = item.signal.execute_at_utc or now_utc
-
-                    # Solo visual: contador en paralelo, sin alterar la estrategia de espera.
-                    countdown_task = asyncio.create_task(
-                        self._render_entry_countdown(item, execute_at),
-                        name=f"entry-countdown-{chat_id}",
-                    )
-
-                    # Buffer para preparar contexto antes del segundo exacto.
-                    buffer_seconds = 2.0
-                    wait_time = (execute_at - now_utc).total_seconds() - buffer_seconds
-
-                    if wait_time > 0:
-                        await asyncio.sleep(wait_time)
-
                     logging.info(
-                        "Preparando ejecución canal='%s' asset=%s",
+                        "Iniciando control de entrada canal='%s' asset=%s",
                         channel_name,
                         item.signal.asset,
-                    )
-
-                    # Espera final para ejecutar en tiempo exacto.
-                    now_utc = datetime.now(timezone.utc)
-                    final_wait = (execute_at - now_utc).total_seconds()
-                    if final_wait > 0:
-                        await asyncio.sleep(final_wait)
-
-                    logging.info(
-                        "EJECUTANDO señal EXACTA canal='%s' asset=%s side=%s",
-                        channel_name,
-                        item.signal.asset,
-                        item.signal.side,
                     )
                     await self._run_signal_task(item)
             finally:
-                if countdown_task is not None:
-                    countdown_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await countdown_task
-                    clear_countdown_line()
                 queue.task_done()
-
-    async def _render_entry_countdown(self, item: QueuedSignal, execute_at: datetime) -> None:
-        buffer_seconds = 2.0
-
-        while True:
-            now_utc = datetime.now(timezone.utc)
-            remaining = (execute_at - now_utc).total_seconds()
-            if remaining <= 0:
-                return
-
-            total_seconds = max(0, int(math.ceil(remaining)))
-            hh = total_seconds // 3600
-            mm = (total_seconds % 3600) // 60
-            ss = total_seconds % 60
-            semaphore = "AMARILLO PREP" if remaining <= buffer_seconds else "ROJO ESPERA"
-
-            print_countdown_line(
-                step_name="ENTRADA",
-                asset=item.signal.asset,
-                side=item.signal.side,
-                amount=item.signal.amount,
-                hh=hh,
-                mm=mm,
-                ss=ss,
-                semaphore=semaphore,
-            )
-
-            await asyncio.sleep(min(1.0, max(0.1, remaining)))
 
     async def _run_signal_task(self, item: QueuedSignal) -> None:
         self._state_manager.inc_active()
@@ -584,15 +518,14 @@ class SignalProcessor:
         time_to_entry = (execute_at - now_utc).total_seconds()
 
         if time_to_entry > self._max_early_signal_seconds:
-            self._log_decision("ignorado_fuera_ventana_temprana", envelope, msg_utc, delay)
+            self._log_decision("senal_temprana_aceptada", envelope, msg_utc, delay)
             logging.info(
-                "Senal ignorada por muy temprana: msg_id=%s faltan=%.1fs max=%.1fs entry_utc=%s",
+                "Senal temprana aceptada: msg_id=%s faltan=%.1fs max_ref=%.1fs entry_utc=%s",
                 envelope.message_id,
                 time_to_entry,
                 self._max_early_signal_seconds,
                 execute_at.isoformat(),
             )
-            return
 
         if time_to_entry < -self._hard_late_signal_seconds:
             self._log_decision("ignorado_por_entrada_expirada", envelope, msg_utc, delay)
