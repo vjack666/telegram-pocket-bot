@@ -117,7 +117,7 @@ class TelegramSignalReader:
         task.add_done_callback(_done_callback)
 
     async def _force_soft_reconnect(self, shutdown_event: asyncio.Event, reason: str) -> None:
-        if shutdown_event.is_set() or not self._restart_after_signal:
+        if shutdown_event.is_set():
             return
 
         async with self._reconnect_lock:
@@ -366,6 +366,11 @@ class TelegramSignalReader:
             try:
                 await self._client.get_me()
                 logging.debug("Telegram keep-alive: OK")
+                # Reconexion periodica para refrescar sesion y evitar degradacion de entrega.
+                await self._force_soft_reconnect(
+                    shutdown_event,
+                    reason=f"periodic_{_KEEP_ALIVE_INTERVAL}s",
+                )
             except Exception as exc:
                 logging.warning("Telegram keep-alive: ping fallido (%s)", exc)
 
