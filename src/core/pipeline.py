@@ -28,7 +28,36 @@ class MessageQueue:
         self._queue: asyncio.Queue[TelegramInboundMessage] = asyncio.Queue(maxsize=maxsize)
 
     async def put(self, envelope: TelegramInboundMessage) -> None:
-        await self._queue.put(envelope)
+        try:
+            self._queue.put_nowait(envelope)
+            return
+        except asyncio.QueueFull:
+            pass
+
+        # latest-wins: si la cola está llena, descartamos el más viejo para no bloquear el handler.
+        dropped: TelegramInboundMessage | None = None
+        try:
+            dropped = self._queue.get_nowait()
+            self._queue.task_done()
+        except asyncio.QueueEmpty:
+            dropped = None
+
+        if dropped is not None:
+            logging.warning(
+                "MessageQueue llena: descartado mensaje viejo chat_id=%s msg_id=%s para priorizar realtime",
+                dropped.chat_id,
+                dropped.message_id,
+            )
+
+        try:
+            self._queue.put_nowait(envelope)
+        except asyncio.QueueFull:
+            # Fallback ultra raro por carrera: no bloquear el producer en ningún caso.
+            logging.warning(
+                "MessageQueue sigue llena tras descarte; mensaje nuevo descartado chat_id=%s msg_id=%s",
+                envelope.chat_id,
+                envelope.message_id,
+            )
 
     async def get(self) -> TelegramInboundMessage:
         return await self._queue.get()
@@ -204,6 +233,7 @@ class SignalProcessor:
         override_asset: str = "",
         override_side: str | None = None,
         event_recorder: Callable[..., None] | None = None,
+        fatal_error_handler: Callable[[str], None] | None = None,
     ) -> None:
         self._message_queue = message_queue
         self._parser = parser
@@ -214,6 +244,8 @@ class SignalProcessor:
         self._channel_queues: dict[int, asyncio.Queue[QueuedSignal]] = {}
         self._channel_workers: dict[int, asyncio.Task] = {}
         self._channel_workers_lock = asyncio.Lock()
+        self._execution_lock = asyncio.Lock()
+        self._channel_priority: dict[int, int] = {}
         self._single_asset_mode = single_asset_mode
         self._default_asset = canonicalize_pocket_asset(default_asset, default_asset="EURUSD OTC")
         self._override_asset = canonicalize_pocket_asset(override_asset, default_asset="").strip()
@@ -222,6 +254,42 @@ class SignalProcessor:
         self._max_early_signal_seconds = 300.0
         self._hard_late_signal_seconds = min(10.0, float(self._late_tolerance_seconds))
         self._event_recorder = event_recorder
+        self._fatal_error_handler = fatal_error_handler
+
+    def _request_restart(self, reason: str) -> None:
+        if self._fatal_error_handler is None:
+            return
+        try:
+            self._fatal_error_handler(reason)
+        except Exception:
+            pass
+
+    def _priority_rank(self, envelope: TelegramInboundMessage) -> int:
+        source = (envelope.source_name or "").strip().lower()
+        if "j_zwrpe_texknjcx" in source or "vip trader a" in source:
+            return 0
+        if "xigjcbsear9jn2rh" in source or "smart signals" in source:
+            return 1
+        return 99
+
+    async def _wait_for_priority_turn(self, chat_id: int, my_rank: int) -> None:
+        if my_rank <= 0:
+            return
+
+        while True:
+            higher_pending = False
+            for queued_chat_id, queued in self._channel_queues.items():
+                if queued_chat_id == chat_id or queued.qsize() <= 0:
+                    continue
+                queued_rank = self._channel_priority.get(queued_chat_id, 99)
+                if queued_rank < my_rank:
+                    higher_pending = True
+                    break
+
+            if not higher_pending and not self._execution_lock.locked():
+                return
+
+            await asyncio.sleep(0.1)
 
     async def enqueue_message(self, envelope: TelegramInboundMessage) -> None:
         await self._message_queue.put(envelope)
@@ -244,6 +312,7 @@ class SignalProcessor:
     async def _enqueue_channel_signal(self, item: QueuedSignal) -> None:
         chat_id = item.envelope.chat_id
         channel_name = item.envelope.source_name or str(chat_id)
+        self._channel_priority[chat_id] = self._priority_rank(item.envelope)
 
         async with self._channel_workers_lock:
             queue = self._channel_queues.get(chat_id)
@@ -302,41 +371,45 @@ class SignalProcessor:
             channel_name = item.envelope.source_name or str(chat_id)
             countdown_task: asyncio.Task | None = None
             try:
-                now_utc = datetime.now(timezone.utc)
-                execute_at = item.signal.execute_at_utc or now_utc
+                my_rank = self._channel_priority.get(chat_id, 99)
+                await self._wait_for_priority_turn(chat_id, my_rank)
 
-                # Solo visual: contador en paralelo, sin alterar la estrategia de espera.
-                countdown_task = asyncio.create_task(
-                    self._render_entry_countdown(item, execute_at),
-                    name=f"entry-countdown-{chat_id}",
-                )
+                async with self._execution_lock:
+                    now_utc = datetime.now(timezone.utc)
+                    execute_at = item.signal.execute_at_utc or now_utc
 
-                # Buffer para preparar contexto antes del segundo exacto.
-                buffer_seconds = 2.0
-                wait_time = (execute_at - now_utc).total_seconds() - buffer_seconds
+                    # Solo visual: contador en paralelo, sin alterar la estrategia de espera.
+                    countdown_task = asyncio.create_task(
+                        self._render_entry_countdown(item, execute_at),
+                        name=f"entry-countdown-{chat_id}",
+                    )
 
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
+                    # Buffer para preparar contexto antes del segundo exacto.
+                    buffer_seconds = 2.0
+                    wait_time = (execute_at - now_utc).total_seconds() - buffer_seconds
 
-                logging.info(
-                    "Preparando ejecución canal='%s' asset=%s",
-                    channel_name,
-                    item.signal.asset,
-                )
+                    if wait_time > 0:
+                        await asyncio.sleep(wait_time)
 
-                # Espera final para ejecutar en tiempo exacto.
-                now_utc = datetime.now(timezone.utc)
-                final_wait = (execute_at - now_utc).total_seconds()
-                if final_wait > 0:
-                    await asyncio.sleep(final_wait)
+                    logging.info(
+                        "Preparando ejecución canal='%s' asset=%s",
+                        channel_name,
+                        item.signal.asset,
+                    )
 
-                logging.info(
-                    "EJECUTANDO señal EXACTA canal='%s' asset=%s side=%s",
-                    channel_name,
-                    item.signal.asset,
-                    item.signal.side,
-                )
-                await self._run_signal_task(item)
+                    # Espera final para ejecutar en tiempo exacto.
+                    now_utc = datetime.now(timezone.utc)
+                    final_wait = (execute_at - now_utc).total_seconds()
+                    if final_wait > 0:
+                        await asyncio.sleep(final_wait)
+
+                    logging.info(
+                        "EJECUTANDO señal EXACTA canal='%s' asset=%s side=%s",
+                        channel_name,
+                        item.signal.asset,
+                        item.signal.side,
+                    )
+                    await self._run_signal_task(item)
             finally:
                 if countdown_task is not None:
                     countdown_task.cancel()
@@ -414,12 +487,20 @@ class SignalProcessor:
                     item.envelope.message_id,
                     exc,
                 )
+            self._request_restart(
+                f"RuntimeError en ejecucion de señal canal={item.envelope.source_name or item.envelope.chat_id} "
+                f"msg_id={item.envelope.message_id}: {message}"
+            )
         except Exception as exc:
             logging.exception(
                 "Error en ejecucion de señal canal='%s' msg_id=%s: %s",
                 item.envelope.source_name or str(item.envelope.chat_id),
                 item.envelope.message_id,
                 exc,
+            )
+            self._request_restart(
+                f"Exception en ejecucion de señal canal={item.envelope.source_name or item.envelope.chat_id} "
+                f"msg_id={item.envelope.message_id}: {type(exc).__name__}: {exc}"
             )
         finally:
             self._state_manager.dec_active()

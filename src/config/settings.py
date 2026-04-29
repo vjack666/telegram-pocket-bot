@@ -176,8 +176,9 @@ def _parse_channel_names(raw: str) -> Dict[str, str]:
         entry = entry.strip()
         if not entry:
             continue
-        colon_idx = entry.find(":")
-        if colon_idx <= 0:
+        # Use the last ':' so URL keys like https://t.me/... are preserved.
+        colon_idx = entry.rfind(":")
+        if colon_idx <= 0 or colon_idx >= len(entry) - 1:
             continue
         key = entry[:colon_idx].strip()
         name = entry[colon_idx + 1:].strip()
