@@ -122,8 +122,13 @@ class SignalParser:
 
         if signal_line_match is not None:
             side = self._normalize_side(signal_line_match.group("side"))
+        elif side_match is not None:
+            side = self._normalize_side(side_match.group(1))
         else:
-            side = self._normalize_side(side_match.group(1)) if side_match else inferred_side
+            # inferred_side is guaranteed non-None: both side_match and inferred_side
+            # being falsy was already rejected by the early return above.
+            assert inferred_side is not None
+            side = inferred_side
         expiry_minutes = int(expiry_match.group(1)) if expiry_match else 1
         if expiry_match is None:
             compact = self._expiry_compact_re.search(norm_text)
