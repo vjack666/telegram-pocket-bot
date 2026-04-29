@@ -45,6 +45,7 @@ class SignalEngine:
         self._max_operation_balance_ratio = 0.10
         self._global_gale = global_gale_state
         self._event_recorder = event_recorder
+        self._last_known_balance: float | None = None
         # CRITICAL FIX: Broker-level lock to serialize all browser operations
         self._broker_lock = asyncio.Lock()
 
@@ -232,9 +233,9 @@ class SignalEngine:
             )
             raise RuntimeError(f"{step_name} cancelada: entrada pasó hace {delay_from_entry:.1f}s")
 
-        # OPTIMIZATION: Get balance and price OUTSIDE the lock (these are read-only, not critical)
-        before_balance = await self._safe_get_balance()
-        entry_price = await self._safe_get_live_price(signal.asset)
+        # Fast path: do not block click for long balance/price reads.
+        before_balance = await self._get_pre_click_balance_fast()
+        entry_price = None
 
         logging.info(
             "%s EJECUTANDO CLICK a T-3s: %s %s amount=%.2f entry_price=%s | time_ok=true delay=%.1fs",
@@ -417,8 +418,8 @@ class SignalEngine:
         amount: float,
     ) -> tuple[float, float | None, datetime]:
         """Ejecuta un paso YA prearmado sin re-preparar ni revalidar activo."""
-        before_balance = await self._safe_get_balance()
-        entry_price = await self._safe_get_live_price(signal.asset)
+        before_balance = await self._get_pre_click_balance_fast()
+        entry_price = None
 
         logging.info(
             "%s CLICK INMEDIATO (prearmada): %s %s amount=%.2f entry_price=%s",
@@ -690,8 +691,8 @@ class SignalEngine:
 
         Retorna True (WIN), False (LOSS) o None (resultado desconocido).
         """
-        # Esperar exactamente 1 segundo después del cierre de la operación
-        wait_until = close_at + timedelta(seconds=1.0)
+        # Iniciar chequeo apenas pasado el cierre y sondear durante una pequeña ventana.
+        wait_until = close_at + timedelta(seconds=0.2)
         now_utc = datetime.now(timezone.utc)
         remaining = (wait_until - now_utc).total_seconds()
 
@@ -711,33 +712,38 @@ class SignalEngine:
         # DECISIÓN: ¿Confiar en DOM o usar BALANCE?
         # ════════════════════════════════════════════════════════════════════
         
-        # Leer balance 1 segundo después del cierre
+        # Leer balance en sondeo corto hasta detectar cambio o agotar gracia.
         try:
-            after_balance = await self._safe_get_balance()
-            diff = after_balance - before_balance
+            poll_deadline = datetime.now(timezone.utc) + timedelta(seconds=max(1, self._result_grace_seconds))
+            while True:
+                after_balance = await self._safe_get_balance()
+                diff = after_balance - before_balance
 
-            logging.info(
-                "Resultado por balance: asset=%s antes=%.2f después=%.2f diff=%.2f",
-                asset,
-                before_balance,
-                after_balance,
-                diff,
-            )
-
-            # Threshold mínimo para evitar ruido de fees o timing impreciso
-            if diff < -0.01:
-                logging.info("✓ LOSS (balance diff=%.2f)", diff)
-                return False
-            elif diff > 0.01:
-                logging.info("✓ WIN (balance diff=%.2f)", diff)
-                return True
-            else:
-                logging.warning(
-                    "Balance sin cambio significativo (diff=%.2f) — resultado DESCONOCIDO. "
-                    "No se ejecutará martingala.",
+                logging.info(
+                    "Resultado por balance: asset=%s antes=%.2f después=%.2f diff=%.2f",
+                    asset,
+                    before_balance,
+                    after_balance,
                     diff,
                 )
-                return None
+
+                # Threshold mínimo para evitar ruido de fees o timing impreciso
+                if diff < -0.01:
+                    logging.info("✓ LOSS (balance diff=%.2f)", diff)
+                    return False
+                if diff > 0.01:
+                    logging.info("✓ WIN (balance diff=%.2f)", diff)
+                    return True
+
+                if datetime.now(timezone.utc) >= poll_deadline:
+                    logging.warning(
+                        "Balance sin cambio significativo (diff=%.2f) — resultado DESCONOCIDO. "
+                        "No se ejecutará martingala.",
+                        diff,
+                    )
+                    return None
+
+                await asyncio.sleep(0.25)
 
         except Exception as exc:
             logging.error(
@@ -753,11 +759,26 @@ class SignalEngine:
         last_exc: Exception | None = None
         for _ in range(tries):
             try:
-                return await self._pocket_client.get_account_balance()
+                value = await self._pocket_client.get_account_balance()
+                self._last_known_balance = value
+                return value
             except Exception as exc:
                 last_exc = exc
                 await asyncio.sleep(2)
         raise RuntimeError(f"No se pudo leer balance para monitoreo: {last_exc}")
+
+    async def _get_pre_click_balance_fast(self) -> float:
+        """Balance para snapshot pre-click sin bloquear el disparo de orden."""
+        try:
+            return await asyncio.wait_for(self._safe_get_balance(), timeout=0.9)
+        except Exception:
+            if self._last_known_balance is not None:
+                logging.debug(
+                    "Usando balance cacheado pre-click para priorizar timing: %.2f",
+                    self._last_known_balance,
+                )
+                return self._last_known_balance
+            return await self._safe_get_balance()
 
     async def _safe_get_live_price(self, asset: str) -> float | None:
         try:
