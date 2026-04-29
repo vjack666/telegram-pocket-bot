@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterable, cast
 
@@ -46,6 +47,7 @@ class TelegramSignalReader:
         backfill_minutes: float = 15,
         backfill_limit: int = 40,
         channel_names: Dict[str, str] | None = None,
+        restart_after_signal: bool = False,
     ) -> None:
         self._source_chats = list(source_chats)
         # Cliente creado una sola vez con reconnect infinito
@@ -61,6 +63,9 @@ class TelegramSignalReader:
         self._backfill_limit = max(1, backfill_limit)
         # raw_chat_key -> display name (ej: "@viptrader" -> "VIP TRADER A")
         self._channel_names: Dict[str, str] = channel_names or {}
+        self._restart_after_signal = restart_after_signal
+        self._reconnect_lock = asyncio.Lock()
+        self._last_forced_reconnect_ts = 0.0
         # chat_id (int) -> display name resuelto en tiempo de ejecución
         self._id_to_name: Dict[int, str] = {}
         # Tareas de despacho al pipeline para no bloquear el handler de Telethon
@@ -111,6 +116,25 @@ class TelegramSignalReader:
 
         task.add_done_callback(_done_callback)
 
+    async def _force_soft_reconnect(self, shutdown_event: asyncio.Event, reason: str) -> None:
+        if shutdown_event.is_set() or not self._restart_after_signal:
+            return
+
+        async with self._reconnect_lock:
+            if shutdown_event.is_set() or not self._client.is_connected():
+                return
+
+            now_ts = time.monotonic()
+            if now_ts - self._last_forced_reconnect_ts < 2.0:
+                return
+            self._last_forced_reconnect_ts = now_ts
+
+            logging.info("Telegram: reinicio suave de conexion (%s)", reason)
+            try:
+                await self._disconnect_with_timeout(timeout_seconds=2.0)
+            except Exception as exc:
+                logging.debug("Telegram: fallo reinicio suave (%s)", exc)
+
     async def run(
         self,
         on_message: MessageHandler,
@@ -136,7 +160,7 @@ class TelegramSignalReader:
 
         # Registrar handlers una sola vez
         if not self._handlers_registered:
-            self._register_handler(on_message, resolved_chats)
+            self._register_handler(on_message, resolved_chats, shutdown_event)
             self._handlers_registered = True
 
         # Lanzar keep-alive en background
@@ -273,7 +297,7 @@ class TelegramSignalReader:
         logging.info("Conectado a Telegram. Escuchando: %s", ", ".join(self._source_chats))
 
         if not self._handlers_registered:
-            self._register_handler(on_message, resolved_chats)
+            self._register_handler(on_message, resolved_chats, asyncio.Event())
             self._handlers_registered = True
 
         if self._backfill_minutes > 0:
@@ -289,6 +313,7 @@ class TelegramSignalReader:
         self,
         on_message: MessageHandler,
         resolved_chats: list[Any],
+        shutdown_event: asyncio.Event,
     ) -> None:
         @self._client.on(events.NewMessage(chats=resolved_chats))
         async def _handler(event: events.NewMessage.Event) -> None:
@@ -313,9 +338,19 @@ class TelegramSignalReader:
                 message_id=event.id,
                 text=text,
                 message_date_utc=event.date.astimezone(timezone.utc),
+                received_at_utc=now_utc,
                 source_name=source_name,
             )
             self._schedule_dispatch(on_message, envelope)
+
+            if self._restart_after_signal:
+                asyncio.create_task(
+                    self._force_soft_reconnect(
+                        shutdown_event,
+                        reason=f"msg_id={event.id} chat_id={chat_id}",
+                    ),
+                    name=f"telegram-soft-reconnect-{chat_id}-{event.id}",
+                )
 
         logging.info("Telegram: handler de mensajes registrado")
 
@@ -365,6 +400,7 @@ class TelegramSignalReader:
                         message_id=msg.id,
                         text=text,
                         message_date_utc=msg.date.astimezone(timezone.utc),
+                        received_at_utc=datetime.now(timezone.utc),
                         source_name=self._id_to_name.get(getattr(entity, "id", 0), ""),
                     )
                 )

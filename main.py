@@ -309,6 +309,7 @@ async def run() -> None:
             backfill_minutes=backfill_minutes,
             backfill_limit=backfill_limit,
             channel_names=settings.telegram_channel_names,
+            restart_after_signal=settings.telegram_restart_after_signal,
         )
 
         _blackbox.record("reader_start_begin", component="telegram_reader")
