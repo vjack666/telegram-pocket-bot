@@ -81,6 +81,12 @@ class SignalParser:
             "SEK", "NOK", "DKK", "SGD", "HKD", "MXN", "ZAR", "TRY",
             "RUB", "BRL", "INR", "CNH", "CNY", "PLN", "HUF", "CZK",
             "XAU", "XAG", "XPT", "XPD",
+            # Exóticos Pocket Option OTC
+            "AED", "EGP", "SAR", "QAR", "KWD", "BHD", "OMR",
+            "IDR", "MYR", "PHP", "THB", "VND", "PKR", "BDT",
+            "KES", "NGN", "GHS", "UGX", "TZS",
+            "CLP", "COP", "PEN", "ARS",
+            "UAH", "KZT", "GEL",
             "BTC", "ETH", "LTC", "XRP", "BNB", "SOL", "ADA", "DOT",
             "USDT", "USDC",
         }
