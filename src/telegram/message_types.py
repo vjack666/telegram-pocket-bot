@@ -8,4 +8,5 @@ class TelegramInboundMessage:
     message_id: int
     text: str
     message_date_utc: datetime
+    received_at_utc: datetime
     source_name: str = ""  # nombre del canal de origen (ej: "VIP TRADER A")

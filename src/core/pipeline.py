@@ -444,16 +444,17 @@ class SignalProcessor:
     async def _process_envelope(self, envelope: TelegramInboundMessage) -> None:
         now_utc = datetime.now(timezone.utc)
         msg_utc = envelope.message_date_utc.astimezone(timezone.utc)
-        delay = (now_utc - msg_utc).total_seconds()
+        ingress_utc = envelope.received_at_utc.astimezone(timezone.utc)
+        delay = (now_utc - ingress_utc).total_seconds()
         key = f"{envelope.chat_id}:{envelope.message_id}"
 
         if self._state_manager.is_duplicate(key, now_utc):
-            self._log_decision("ignorado_por_duplicado", envelope, msg_utc, delay)
+            self._log_decision("ignorado_por_duplicado", envelope, msg_utc, ingress_utc, delay)
             return
 
-        signal = self._parser.parse(envelope.text, received_at_utc=msg_utc)
+        signal = self._parser.parse(envelope.text, received_at_utc=ingress_utc)
         if signal is None:
-            self._log_decision("ignorado_sin_senal", envelope, msg_utc, delay)
+            self._log_decision("ignorado_sin_senal", envelope, msg_utc, ingress_utc, delay)
             logging.info(
                 "Parser no detecto senal en msg_id=%s canal='%s' texto='%s'",
                 envelope.message_id,
@@ -505,7 +506,7 @@ class SignalProcessor:
         if self._single_asset_mode:
             parsed_asset = canonicalize_pocket_asset(signal.asset, default_asset=self._default_asset)
             if parsed_asset != self._default_asset:
-                self._log_decision("ignorado_por_activo", envelope, msg_utc, delay)
+                self._log_decision("ignorado_por_activo", envelope, msg_utc, ingress_utc, delay)
                 logging.info(
                     "Senal ignorada por modo un par: asset=%s default=%s msg_id=%s",
                     parsed_asset,
@@ -518,7 +519,7 @@ class SignalProcessor:
         time_to_entry = (execute_at - now_utc).total_seconds()
 
         if time_to_entry > self._max_early_signal_seconds:
-            self._log_decision("senal_temprana_aceptada", envelope, msg_utc, delay)
+            self._log_decision("senal_temprana_aceptada", envelope, msg_utc, ingress_utc, delay)
             logging.info(
                 "Senal temprana aceptada: msg_id=%s faltan=%.1fs max_ref=%.1fs entry_utc=%s",
                 envelope.message_id,
@@ -528,7 +529,7 @@ class SignalProcessor:
             )
 
         if time_to_entry < -self._hard_late_signal_seconds:
-            self._log_decision("ignorado_por_entrada_expirada", envelope, msg_utc, delay)
+            self._log_decision("ignorado_por_entrada_expirada", envelope, msg_utc, ingress_utc, delay)
             logging.info(
                 "Senal ignorada por entrada expirada: msg_id=%s atraso=%.1fs max=%.1fs entry_utc=%s",
                 envelope.message_id,
@@ -551,7 +552,7 @@ class SignalProcessor:
         if self._busy_policy == "ignore_if_busy" and (
             self._state_manager.execution_active or total_pending > 0
         ):
-            self._log_decision("ignorado_por_sistema_ocupado", envelope, msg_utc, delay)
+            self._log_decision("ignorado_por_sistema_ocupado", envelope, msg_utc, ingress_utc, delay)
             return
 
         await self._enqueue_channel_signal(
@@ -561,21 +562,23 @@ class SignalProcessor:
                 delay_seconds=delay,
             )
         )
-        self._log_decision("procesado", envelope, msg_utc, delay)
+        self._log_decision("procesado", envelope, msg_utc, ingress_utc, delay)
 
     def _log_decision(
         self,
         action: str,
         envelope: TelegramInboundMessage,
         msg_utc: datetime,
+        ingress_utc: datetime,
         delay: float,
     ) -> None:
         logging.info(
-            "msg_id=%s chat_id=%s canal='%s' msg_utc=%s delay_s=%.3f action=%s",
+            "msg_id=%s chat_id=%s canal='%s' msg_utc=%s ingress_utc=%s delay_s=%.3f action=%s",
             envelope.message_id,
             envelope.chat_id,
             envelope.source_name or str(envelope.chat_id),
             msg_utc.isoformat(),
+            ingress_utc.isoformat(),
             delay,
             action,
         )
