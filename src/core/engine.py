@@ -237,7 +237,7 @@ class SignalEngine:
         entry_price = await self._safe_get_live_price(signal.asset)
 
         logging.info(
-            "%s EJECUTANDO CLICK a T-3: %s %s amount=%.2f entry_price=%s | time_ok=true delay=%.1fs",
+            "%s EJECUTANDO CLICK a T-3s: %s %s amount=%.2f entry_price=%s | time_ok=true delay=%.1fs",
             step_name,
             signal.asset,
             signal.side,
@@ -500,6 +500,11 @@ class SignalEngine:
         delay = (execute_at - now_utc).total_seconds()
         prepare_lead_seconds, send_lead_seconds = self._dynamic_timing_leads(signal.expiry_minutes)
 
+        # ENTRADA: preparar desde que llega la señal y disparar 3s antes del inicio de la vela.
+        eager_prepare = step_name == "ENTRADA"
+        if eager_prepare:
+            send_lead_seconds = 3.0
+
         if delay > send_lead_seconds:
             logging.info(
                 "%s programada: %s %s entra a %s UTC (en %.1fs) | semaforo prep=%.1fs envio=%.1fs",
@@ -519,6 +524,7 @@ class SignalEngine:
                     amount,
                     prepare_lead_seconds,
                     send_lead_seconds,
+                    eager_prepare=eager_prepare,
                 )
             except RuntimeError as exc:
                 # CRITICAL FIX: If asset not available, cancel signal immediately
@@ -796,15 +802,42 @@ class SignalEngine:
         amount: float,
         prepare_lead_seconds: float,
         send_lead_seconds: float,
+        eager_prepare: bool = False,
     ) -> None:
         preparation_done = False
+        next_eager_retry_at = datetime.now(timezone.utc)
+
+        if eager_prepare:
+            try:
+                logging.info(
+                    "%s prearmado temprano: preparando orden desde llegada de señal.",
+                    step_name,
+                )
+                await self._pocket_client.prepare_order_for_execution(
+                    signal.asset,
+                    amount,
+                    signal.expiry_minutes,
+                    max_retries=3,
+                )
+                preparation_done = True
+            except Exception as exc:
+                logging.info(
+                    "%s prearmado temprano no completado en primer intento: %s. Se reintentara en countdown.",
+                    step_name,
+                    exc,
+                )
+                next_eager_retry_at = datetime.now(timezone.utc) + timedelta(seconds=3)
 
         while True:
-            remaining = (execute_at - datetime.now(timezone.utc)).total_seconds()
+            now_utc = datetime.now(timezone.utc)
+            remaining = (execute_at - now_utc).total_seconds()
             if remaining <= send_lead_seconds:
                 break
 
-            if remaining <= prepare_lead_seconds and not preparation_done:
+            should_eager_retry = eager_prepare and not preparation_done and now_utc >= next_eager_retry_at
+            should_lead_prepare = remaining <= prepare_lead_seconds and not preparation_done
+
+            if should_eager_retry or should_lead_prepare:
                 try:
                     await self._pocket_client.prepare_order_for_execution(
                         signal.asset,
@@ -814,6 +847,8 @@ class SignalEngine:
                     )
                     preparation_done = True
                 except Exception as exc:
+                    if should_eager_retry:
+                        next_eager_retry_at = datetime.now(timezone.utc) + timedelta(seconds=3)
                     logging.debug("Fallo preparación en countdown %s: %s", step_name, exc)
 
             remaining_int = max(0, int(remaining))
