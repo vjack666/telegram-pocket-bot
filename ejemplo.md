@@ -64520,4 +64520,3 @@ Usa martingala si es necesario 👇
 
 📊 Haz clic aquí para abrir el bróker
 ➡️ ¿No sabes cómo operar? Haz clic aquí
-

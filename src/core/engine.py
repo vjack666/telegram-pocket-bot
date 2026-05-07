@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from src.core.models import TradingSignal
 from src.core.console_hub import clear_countdown_line, print_countdown_line, print_order_event, print_signal_summary
@@ -9,6 +9,8 @@ from src.pocket_option.assets import canonicalize_pocket_asset, normalize_asset_
 from src.pocket_option.client import PocketOptionBaseClient
 from src.pocket_option.trade_panel_feed import LiveTradeSnapshot
 from src.core.pipeline import MasanielloSessionState, RecoveryProfile
+from src.core.equity_bands import EquityBandManager
+from src.core.daily_profit_tracker import DailyProfitTracker
 
 
 class SignalEngine:
@@ -30,6 +32,8 @@ class SignalEngine:
         recovery_profile: RecoveryProfile | None = None,
         calc_base_balance: float = 300.0,
         event_recorder: Callable[..., None] | None = None,
+        equity_manager: Optional[EquityBandManager] = None,
+        daily_profit_tracker: Optional[DailyProfitTracker] = None,
     ) -> None:
         self._pocket_client = pocket_client
         self._martingale_amounts = [value for value in martingale_amounts if value > 0] or [2.0, 4.0, 10.0]
@@ -62,6 +66,8 @@ class SignalEngine:
         self._global_gale = global_gale_state
         self._event_recorder = event_recorder
         self._last_known_balance: float | None = None
+        self._equity_manager: Optional[EquityBandManager] = equity_manager
+        self._daily_profit_tracker: Optional[DailyProfitTracker] = daily_profit_tracker
         # CRITICAL FIX: Broker-level lock to serialize all browser operations
         self._broker_lock = asyncio.Lock()
 
@@ -108,6 +114,50 @@ class SignalEngine:
         )
 
         await self._execute_step_chain(signal, cycle_amounts, entry_times, step_idx=start_step)
+
+        # Actualizar capital operativo dinámico tras cada ciclo completo
+        await self._apply_equity_update()
+
+    async def _apply_equity_update(self) -> None:
+        """Lee el balance actual y notifica al EquityBandManager.
+
+        Si la banda cambia, sincroniza _calc_base_balance y la base de
+        MasanielloSessionState para que el próximo ciclo use el sizing correcto.
+        """
+        if self._equity_manager is None:
+            return
+        try:
+            balance = await self._safe_get_balance()
+        except Exception as exc:
+            logging.warning("[EquityBands] No se pudo leer balance para actualización: %s", exc)
+            return
+
+        changed = self._equity_manager.notify_balance(balance)
+        if changed:
+            new_base = self._equity_manager.operational_base
+            self._calc_base_balance = new_base
+            if self._masaniello_session is not None:
+                self._masaniello_session.update_base(new_base)
+            self._emit_event(
+                "equity_band_changed",
+                balance=balance,
+                new_operational_base=new_base,
+                daily_target=self._equity_manager.daily_target,
+                **self._equity_manager.status(),
+            )
+            logging.info(
+                "[EquityBands] Base operativa actualizada → %.2f | "
+                "meta_diaria=%.2f | balance=%.2f",
+                new_base,
+                self._equity_manager.daily_target,
+                balance,
+            )
+        else:
+            logging.debug(
+                "[EquityBands] Sin cambio de banda (balance=%.2f base=%.2f)",
+                balance,
+                self._equity_manager.operational_base,
+            )
 
     async def _execute_step_chain(
         self,
@@ -165,6 +215,16 @@ class SignalEngine:
                 self._global_gale.record_win()
                 if self._masaniello_session is not None:
                     self._masaniello_session.record_win()
+                
+                # Registrar en daily profit tracker
+                pnl_win = round(amount * self._calc_payout, 2)
+                if self._daily_profit_tracker is not None:
+                    tracker_status = self._daily_profit_tracker.record_trade(pnl_win)
+                    self._emit_event("daily_profit_update", **tracker_status)
+                    if tracker_status.get("meta_just_reached"):
+                        logging.info("[Daily Meta] ✓ META ALCANZADA: $%.2f | Modo DEFENSIVO activado", 
+                                   tracker_status.get("daily_pnl", 0))
+                
                 self._emit_event(
                     "trade_result_win",
                     asset=signal.asset,
@@ -187,6 +247,19 @@ class SignalEngine:
                 self._global_gale.record_loss(amount)
                 if self._masaniello_session is not None:
                     self._masaniello_session.record_loss()
+                
+                # Registrar en daily profit tracker (pérdida)
+                pnl_loss = round(-amount, 2)
+                if self._daily_profit_tracker is not None:
+                    tracker_status = self._daily_profit_tracker.record_trade(pnl_loss)
+                    self._emit_event("daily_profit_update", **tracker_status)
+                    # Log del progreso hacia la meta
+                    logging.info("[Daily Meta] Progreso: $%.2f / $%.2f (%.1f%%) | Modo: %s",
+                               tracker_status.get("daily_pnl", 0),
+                               tracker_status.get("daily_target", 0),
+                               tracker_status.get("progress_pct", 0),
+                               "DEFENSIVO" if tracker_status.get("defensive_mode") else "NORMAL")
+                
                 self._emit_event(
                     "trade_result_loss",
                     asset=signal.asset,

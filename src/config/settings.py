@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -64,6 +64,21 @@ class AppSettings:
     calc_base_balance: float      # balance fijo para calculator (base fija)
     recovery_g1_mult: float       # 0.0 = auto desde payout
     recovery_g2_mult: float       # 0.0 = auto desde payout
+    # ── Capital operativo dinámico (equity bands) ──────────────────────────
+    equity_bands_enabled: bool                  # activar sistema de bandas
+    equity_bands: List[Tuple[float, float]]     # [(min_balance, base), ...]
+    equity_band_upgrade_sessions: int           # sesiones antes de subir banda
+    equity_daily_target_pct: float              # meta diaria = base × pct
+    equity_state_persist: bool                  # persistir estado en disco
+    equity_state_path: str                      # ruta del json de estado
+    equity_deposit_guard_enabled: bool          # detectar +equity externo
+    equity_deposit_jump_pct: float              # salto relativo para depósito
+    equity_deposit_cooldown_sessions: int       # cooldown de upgrades
+    # ── Daily Profit Tracking ──────────────────────────────────────────────
+    daily_profit_tracking_enabled: bool         # activar tracking diario
+    daily_profit_target: float                  # meta diaria en dinero ($60)
+    daily_profit_defensive_mode: bool           # cambiar a defensive tras meta
+    daily_profit_state_path: str                # ruta del json de estado diario
 
     @staticmethod
     def load() -> "AppSettings":
@@ -170,6 +185,45 @@ class AppSettings:
             calc_base_balance=float(os.getenv("APP_CALC_BASE_BALANCE", "300")),
             recovery_g1_mult=float(os.getenv("APP_RECOVERY_G1_MULT", "").strip() or "0"),
             recovery_g2_mult=float(os.getenv("APP_RECOVERY_G2_MULT", "").strip() or "0"),
+            equity_bands_enabled=_to_bool(os.getenv("APP_EQUITY_BANDS_ENABLED", "false")),
+            equity_bands=_parse_equity_bands(
+                os.getenv("APP_EQUITY_BANDS", "0:300,400:500,700:800,1200:1500")
+            ),
+            equity_band_upgrade_sessions=int(
+                os.getenv("APP_EQUITY_BAND_UPGRADE_SESSIONS", "3")
+            ),
+            equity_daily_target_pct=float(
+                os.getenv("APP_EQUITY_DAILY_TARGET_PCT", "0.20")
+            ),
+            equity_state_persist=_to_bool(
+                os.getenv("APP_EQUITY_STATE_PERSIST", "true")
+            ),
+            equity_state_path=os.getenv(
+                "APP_EQUITY_STATE_PATH",
+                "runtime/equity_bands_state.json",
+            ).strip(),
+            equity_deposit_guard_enabled=_to_bool(
+                os.getenv("APP_EQUITY_DEPOSIT_GUARD_ENABLED", "false")
+            ),
+            equity_deposit_jump_pct=float(
+                os.getenv("APP_EQUITY_DEPOSIT_JUMP_PCT", "0.60")
+            ),
+            equity_deposit_cooldown_sessions=int(
+                os.getenv("APP_EQUITY_DEPOSIT_COOLDOWN_SESSIONS", "3")
+            ),
+            daily_profit_tracking_enabled=_to_bool(
+                os.getenv("APP_DAILY_PROFIT_TRACKING_ENABLED", "false")
+            ),
+            daily_profit_target=float(
+                os.getenv("APP_DAILY_PROFIT_TARGET", "60.0")
+            ),
+            daily_profit_defensive_mode=_to_bool(
+                os.getenv("APP_DAILY_PROFIT_DEFENSIVE_MODE", "true")
+            ),
+            daily_profit_state_path=os.getenv(
+                "APP_DAILY_PROFIT_STATE_PATH",
+                "runtime/daily_profit_state.json",
+            ).strip(),
         )
 
 
@@ -274,3 +328,29 @@ def _normalize_side_override(raw: str) -> Optional[str]:
     if side in {"BUY", "SELL"}:
         return side
     return None
+
+
+def _parse_equity_bands(raw: str) -> List[Tuple[float, float]]:
+    """Parsea 'min:base,min:base,...' → lista de tuplas ordenadas ascendente.
+
+    Ejemplo: '0:300,400:500,700:800,1200:1500'
+    Retorna al menos [(0, 300)] ante cualquier error de parseo.
+    """
+    result: List[Tuple[float, float]] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":")
+        if len(parts) != 2:
+            continue
+        try:
+            min_b = float(parts[0].strip())
+            base = float(parts[1].strip())
+        except ValueError:
+            continue
+        if base > 0:
+            result.append((min_b, base))
+    if not result:
+        result = [(0.0, 300.0)]
+    return sorted(result, key=lambda x: x[0])

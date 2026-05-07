@@ -227,6 +227,16 @@ class MasanielloSessionState:
             self._wins = 0
             self._losses = 0
 
+    def update_base(self, new_base: float) -> None:
+        """Actualiza la base de sizing Masaniello (llamado por EquityBandManager)."""
+        new_base = max(1.0, new_base)
+        if new_base != self._base_balance:
+            logging.info(
+                "MasanielloSession base actualizada: %.2f → %.2f",
+                self._base_balance,
+                new_base,
+            )
+            self._base_balance = new_base
     def _masaniello_stake(self, balance: float, losses_so_far: int, wins_so_far: int) -> float:
         n = self._n_ops
         w = self._w_needed

@@ -21,6 +21,8 @@ from src.config.settings import AppSettings
 from src.core.engine import SignalEngine
 from src.core.models import TradingSignal
 from src.core.pipeline import MessageQueue, SignalProcessor, StateManager, GlobalGaleState, MasanielloSessionState, RecoveryProfile
+from src.core.equity_bands import EquityBandManager
+from src.core.daily_profit_tracker import DailyProfitTracker
 from src.pocket_option.client import PocketOptionDemoClient
 from src.utils.blackbox import DeferredBlackBoxRecorder, ShutdownSnapshot
 from src.utils.logger import setup_logging
@@ -254,6 +256,71 @@ async def run() -> None:
             "REAL (click en broker)" if settings.pocket_execute_orders else "SIMULADO (sin click)",
         )
 
+        # ── Capital operativo dinámico (equity bands) ────────────────────────
+        equity_manager: EquityBandManager | None = None
+        if settings.equity_bands_enabled:
+            equity_manager = EquityBandManager(
+                bands=settings.equity_bands,
+                upgrade_sessions_required=settings.equity_band_upgrade_sessions,
+                daily_target_pct=settings.equity_daily_target_pct,
+                initial_balance=balance,
+                state_path=settings.equity_state_path if settings.equity_state_persist else None,
+                deposit_guard_enabled=settings.equity_deposit_guard_enabled,
+                deposit_guard_jump_pct=settings.equity_deposit_jump_pct,
+                deposit_guard_cooldown_sessions=settings.equity_deposit_cooldown_sessions,
+            )
+            # Reconciliación al arranque: aplica downgrade inmediato si el balance actual quedó
+            # por debajo de una base restaurada de ejecuciones anteriores.
+            equity_manager.notify_balance(balance)
+            _blackbox.record(
+                "equity_bands_init",
+                component="equity_bands",
+                **equity_manager.status(),
+            )
+            logging.info(
+                "[EquityBands] ACTIVO | base_operativa=%.2f | meta_diaria=%.2f (%.0f%%) | "
+                "bandas=%s | upgrade_sesiones=%d | persist=%s path=%s | deposit_guard=%s",
+                equity_manager.operational_base,
+                equity_manager.daily_target,
+                settings.equity_daily_target_pct * 100,
+                settings.equity_bands,
+                settings.equity_band_upgrade_sessions,
+                settings.equity_state_persist,
+                settings.equity_state_path,
+                settings.equity_deposit_guard_enabled,
+            )
+        else:
+            logging.info(
+                "[EquityBands] DESACTIVADO (APP_EQUITY_BANDS_ENABLED=false). "
+                "Usando base fija: %.2f",
+                settings.calc_base_balance,
+            )
+
+        # ── Daily Profit Tracking ────────────────────────────────────────────
+        daily_profit_tracker: DailyProfitTracker | None = None
+        if settings.daily_profit_tracking_enabled:
+            daily_profit_tracker = DailyProfitTracker(
+                daily_target=settings.daily_profit_target,
+                state_path=settings.daily_profit_state_path,
+                enable_defensive_mode=settings.daily_profit_defensive_mode,
+            )
+            _blackbox.record(
+                "daily_profit_tracker_init",
+                component="daily_profit",
+                **daily_profit_tracker.status(),
+            )
+            logging.info(
+                "[DailyProfit] ACTIVO | meta_diaria=$%.2f | modo_defensivo=%s | persist=%s path=%s",
+                settings.daily_profit_target,
+                settings.daily_profit_defensive_mode,
+                True,
+                settings.daily_profit_state_path,
+            )
+        else:
+            logging.info(
+                "[DailyProfit] DESACTIVADO (APP_DAILY_PROFIT_TRACKING_ENABLED=false)"
+            )
+
         if not settings.enable_telegram:
             logging.info("APP_ENABLE_TELEGRAM=false. Modo Pocket Option activo.")
             if settings.pocket_keep_browser_open:
@@ -271,10 +338,16 @@ async def run() -> None:
         _blackbox.record("telegram_pipeline_init", component="main")
         state_manager = StateManager(dedupe_ttl_seconds=settings.message_dedupe_ttl_seconds)
         global_gale_state = GlobalGaleState(profit_target=2.0)
+        # Si equity bands está activo, la base de Masaniello arranca desde la base operativa
+        _initial_masaniello_base = (
+            equity_manager.operational_base
+            if equity_manager is not None
+            else settings.masaniello_base_balance
+        )
         masaniello_session = MasanielloSessionState(
             n_ops=settings.masaniello_n_ops,
             w_needed=settings.masaniello_w_needed,
-            base_balance=settings.masaniello_base_balance,
+            base_balance=_initial_masaniello_base,
             payout_mult=settings.calc_payout_percent / 100.0 + 1.0,
         )
         # RecoveryProfile: g1/g2 desde .env; si vacios, calculo automatico desde payout.
@@ -298,6 +371,12 @@ async def run() -> None:
             recovery_profile.max_trade_pct * 100,
             recovery_profile.max_total_exposure_pct * 100,
             ".env" if settings.recovery_g1_mult > 0.0 else "auto-payout",
+        )
+        # La base inicial del calculator: equity_manager la gestiona si está activo
+        _initial_calc_base = (
+            equity_manager.operational_base
+            if equity_manager is not None
+            else settings.calc_base_balance
         )
         message_queue = MessageQueue(maxsize=settings.processing_queue_maxsize)
         parser = SignalParser(
@@ -333,8 +412,10 @@ async def run() -> None:
             global_gale_state=global_gale_state,
             masaniello_session=masaniello_session,
             recovery_profile=recovery_profile,
-            calc_base_balance=settings.calc_base_balance,
+            calc_base_balance=_initial_calc_base,
             event_recorder=_blackbox.record,
+            equity_manager=equity_manager,
+            daily_profit_tracker=daily_profit_tracker,
         )
         processor = SignalProcessor(
             message_queue=message_queue,
