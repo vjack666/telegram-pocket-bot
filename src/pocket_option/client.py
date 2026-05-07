@@ -123,7 +123,11 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
 
             self._is_starting = True
             self._active_playwright_ops += 1
-            profile_path = str(Path(self._profile_dir).resolve())
+            primary_profile_path = str(Path(self._profile_dir).resolve())
+            fallback_profile_path = str(Path(self._profile_dir).resolve().with_name(
+                Path(self._profile_dir).resolve().name + "_fallback"
+            ))
+            active_profile_path = primary_profile_path
             max_profile_open_retries = 8
             profile_open_retry_delay_seconds = 2.0
 
@@ -133,10 +137,16 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
                     self._playwright = await async_playwright().start()
                     try:
                         self._context = await self._playwright.chromium.launch_persistent_context(
-                            user_data_dir=profile_path,
+                            user_data_dir=active_profile_path,
                             headless=self._headless,
                             args=["--disable-blink-features=AutomationControlled"],
                         )
+                        if active_profile_path != primary_profile_path:
+                            logging.warning(
+                                "Se uso perfil alterno de navegador: %s (perfil principal bloqueado)",
+                                active_profile_path,
+                            )
+                            self._profile_dir = active_profile_path
                         break
                     except PlaywrightError as exc:
                         last_profile_exc = exc
@@ -144,6 +154,16 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
                         self._playwright = None
 
                         if _is_profile_in_use_error(exc) and attempt < max_profile_open_retries:
+                            # Si el perfil principal parece bloqueado, migrar a un perfil alterno limpio.
+                            if (
+                                active_profile_path == primary_profile_path
+                                and attempt >= 2
+                            ):
+                                active_profile_path = fallback_profile_path
+                                logging.warning(
+                                    "Perfil principal bloqueado. Cambiando a perfil alterno: %s",
+                                    active_profile_path,
+                                )
                             logging.warning(
                                 "Perfil de navegador en uso (intento %s/%s). Reintentando en %.1fs...",
                                 attempt,
@@ -1387,6 +1407,7 @@ def _is_profile_in_use_error(exc: BaseException) -> bool:
         or "process singleton" in lowered
         or "profile appears to be in use" in lowered
         or "another browser" in lowered and "profile" in lowered
+        or ("failed to create" in lowered and "user data directory" in lowered)
     )
 
 

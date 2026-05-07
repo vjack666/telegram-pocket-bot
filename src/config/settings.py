@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -66,13 +67,24 @@ class AppSettings:
 
     @staticmethod
     def load() -> "AppSettings":
-        load_dotenv()
+        # Carga .env de usuario (AppData) antes del .env local.
+        # Si ambos existen, el primero cargado mantiene prioridad porque override=False.
+        appdata = os.getenv("APPDATA", "").strip()
+        if appdata:
+            user_env = Path(appdata) / "PocketOptionBot" / ".env"
+            if user_env.exists():
+                load_dotenv(dotenv_path=user_env, override=False)
+
+        load_dotenv(override=False)
 
         api_id_raw = os.getenv("TELEGRAM_API_ID", "").strip()
         api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
         session_name = os.getenv("TELEGRAM_SESSION_NAME", "signal_reader").strip()
         source_chats = _csv_list(os.getenv("TELEGRAM_SOURCE_CHATS", ""))
-        enable_telegram = _to_bool(os.getenv("APP_ENABLE_TELEGRAM", "false"))
+        enable_telegram_flag = _to_bool(os.getenv("APP_ENABLE_TELEGRAM", "false"))
+        # Si hay credenciales completas, activar Telegram aunque la plantilla haya quedado en false.
+        has_telegram_config = bool(api_id_raw and api_hash and source_chats)
+        enable_telegram = enable_telegram_flag or has_telegram_config
 
         if enable_telegram:
             if not api_id_raw:
@@ -116,7 +128,9 @@ class AppSettings:
                 "POCKET_DEMO_URL",
                 "https://pocketoption.com/en/cabinet/demo-quick-high-low/",
             ).strip(),
-            pocket_profile_dir=os.getenv("POCKET_PROFILE_DIR", ".pocket_profile").strip(),
+            pocket_profile_dir=_resolve_profile_dir(
+                os.getenv("POCKET_PROFILE_DIR", ".pocket_profile")
+            ),
             pocket_headless=_to_bool(os.getenv("POCKET_HEADLESS", "false")),
             pocket_execute_orders=_to_bool(os.getenv("POCKET_EXECUTE_ORDERS", "false")),
             pocket_max_order_amount=float(os.getenv("POCKET_MAX_ORDER_AMOUNT", "5")),
@@ -161,6 +175,36 @@ class AppSettings:
 
 def _csv_list(raw: str) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _resolve_profile_dir(raw: str) -> str:
+    """Resuelve POCKET_PROFILE_DIR a una ruta escribible.
+
+    - Si se da ruta absoluta, se respeta.
+    - Si es relativa y no se puede escribir (p.ej. Program Files), usa AppData.
+    """
+    clean = (raw or "").strip() or ".pocket_profile"
+    candidate = Path(clean)
+
+    if candidate.is_absolute():
+        return str(candidate)
+
+    # Intentar usar la ruta relativa configurada.
+    try:
+        resolved = candidate.resolve()
+        resolved.mkdir(parents=True, exist_ok=True)
+        probe = resolved / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return str(resolved)
+    except Exception:
+        appdata = os.getenv("APPDATA", "").strip()
+        if appdata:
+            fallback = Path(appdata) / "PocketOptionBot" / "browser_profile"
+        else:
+            fallback = Path.home() / ".pocketoptionbot" / "browser_profile"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return str(fallback)
 
 
 def _csv_float_list(raw: str, fallback: List[float]) -> List[float]:

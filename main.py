@@ -37,6 +37,40 @@ class ShutdownDiagnostics:
 _shutdown_diag = ShutdownDiagnostics()
 
 
+def _is_dir_writable(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_runtime_base_dir() -> Path:
+    """Selecciona una carpeta runtime escribible.
+
+    Prioriza `runtime/` local para desarrollo; si no hay permisos (Program Files),
+    usa AppData del usuario.
+    """
+    local_runtime = Path("runtime")
+    if _is_dir_writable(local_runtime):
+        return local_runtime
+
+    appdata = os.getenv("APPDATA", "").strip()
+    if appdata:
+        appdata_runtime = Path(appdata) / "PocketOptionBot" / "runtime"
+        appdata_runtime.mkdir(parents=True, exist_ok=True)
+        return appdata_runtime
+
+    # Fallback final si APPDATA no existe por algun motivo.
+    return local_runtime
+
+
+_RUNTIME_BASE_DIR = _resolve_runtime_base_dir()
+
+
 def _build_shutdown_snapshot() -> ShutdownSnapshot:
     return ShutdownSnapshot(
         reason=_shutdown_diag.reason,
@@ -45,7 +79,7 @@ def _build_shutdown_snapshot() -> ShutdownSnapshot:
 
 
 _blackbox = DeferredBlackBoxRecorder(
-    base_dir="runtime/blackbox",
+    base_dir=str(_RUNTIME_BASE_DIR / "blackbox"),
     max_events=50000,
     shutdown_snapshot=_build_shutdown_snapshot,
 )
@@ -56,7 +90,7 @@ MAX_MAIN_RESTARTS = 5
 
 _run_phase = "initializing"
 _run_started_monotonic = time.monotonic()
-_RUNTIME_LOCK_PATH = Path("runtime") / "main.lock"
+_RUNTIME_LOCK_PATH = _RUNTIME_BASE_DIR / "main.lock"
 _BLACKBOX_LOG_HANDLER_ATTACHED = False
 _BLACKBOX_LOG_MAX_MESSAGE_CHARS = 20000
 
@@ -758,7 +792,295 @@ def _acquire_single_instance_lock() -> Callable[[], None]:
     return _release
 
 
+def _ensure_playwright_browsers() -> None:
+    """Instala Chromium la primera vez usando el driver interno de Playwright.
+    Funciona tanto en desarrollo (python main.py) como en .exe (PyInstaller).
+    """
+    import subprocess
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser_path = p.chromium.executable_path
+        if Path(browser_path).exists():
+            return  # ya instalado
+    except Exception:
+        pass  # playwright no pudo arrancar, intentar instalar igualmente
+
+    print("Instalando navegador Chromium (primera ejecucion, ~150MB)...")
+    try:
+        # Usar el driver interno de Playwright (funciona dentro del .exe)
+        from playwright._impl._driver import compute_driver_executable
+        driver_exec, driver_cli = compute_driver_executable()
+        import os
+        env = os.environ.copy()
+        result = subprocess.run(
+            [str(driver_exec), str(driver_cli), "install", "chromium"],
+            env=env,
+            capture_output=False,
+        )
+        if result.returncode == 0:
+            print("Chromium instalado correctamente.")
+        else:
+            print("Advertencia: la instalacion de Chromium puede no haber completado.")
+    except Exception as exc:
+        print(f"No se pudo instalar Chromium automaticamente: {exc}")
+        print("Instala manualmente ejecutando: python -m playwright install chromium")
+
+
+_CONFIG_FIELDS = [
+    ("TELEGRAM_API_ID",    "Telegram API ID",   "Numero de tu cuenta en my.telegram.org → API development tools"),
+    ("TELEGRAM_API_HASH",  "Telegram API Hash", "Hash de tu cuenta en my.telegram.org → API development tools"),
+    ("TELEGRAM_SOURCE_CHATS", "Canal de senales", "Username del canal, ej: @viptradercanal"),
+]
+
+_ENV_PATH = Path(".env")
+
+
+def _user_env_path() -> Path:
+    appdata = os.getenv("APPDATA", "").strip()
+    if appdata:
+        return Path(appdata) / "PocketOptionBot" / ".env"
+    return Path.home() / ".pocketoptionbot.env"
+
+
+def _env_candidates() -> list[Path]:
+    # Prioridad: .env local (desarrollo) y luego .env de usuario (instalador Program Files).
+    return [_ENV_PATH, _user_env_path()]
+
+
+def _is_writable(path: Path) -> bool:
+    try:
+        if path.exists():
+            return os.access(path, os.W_OK)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        test_file = path.parent / f".{path.name}.write_test"
+        test_file.write_text("ok", encoding="utf-8")
+        test_file.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _select_target_env_path() -> Path:
+    if _is_writable(_ENV_PATH):
+        return _ENV_PATH
+    return _user_env_path()
+
+
+def _env_needs_setup() -> bool:
+    """Devuelve True si faltan credenciales clave en el .env."""
+    existing = _read_env_existing()
+    for key, _, _ in _CONFIG_FIELDS:
+        if not existing.get(key, "").strip():
+            return True
+    return False
+
+
+def _save_env_values(values: dict) -> None:
+    """Escribe los valores en un .env escribible, con fallback a AppData del usuario."""
+    values = dict(values)
+    # Si el usuario completa el wizard, activar lectura de Telegram automaticamente.
+    values["APP_ENABLE_TELEGRAM"] = "true"
+
+    target = _select_target_env_path()
+
+    if target.exists():
+        lines = target.read_text(encoding="utf-8").splitlines()
+    else:
+        import shutil
+        example = Path(".env.example")
+        if example.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(example, target)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
+
+    updated: set = set()
+    new_lines = []
+    for line in lines:
+        replaced = False
+        for key, val in values.items():
+            if line.startswith(key + "=") or line.startswith(key + " ="):
+                new_lines.append(f"{key}={val}")
+                updated.add(key)
+                replaced = True
+                break
+        if not replaced:
+            new_lines.append(line)
+
+    for key, val in values.items():
+        if key not in updated:
+            new_lines.append(f"{key}={val}")
+
+    try:
+        target.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    except PermissionError as exc:
+        fallback = _user_env_path()
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        fallback.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        print("Configuracion guardada correctamente en tu perfil de usuario.")
+        print(f"Ruta: {fallback}")
+    except Exception as exc:
+        raise RuntimeError(f"No se pudo guardar configuracion: {exc}") from exc
+
+
+def _read_env_existing() -> dict:
+    """Lee valores de .env local y de AppData (AppData tiene prioridad)."""
+    result: dict = {}
+    for env_path in _env_candidates():
+        if not env_path.exists():
+            continue
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                result[k.strip()] = v.strip()
+    return result
+
+
+# Pasos del wizard: (env_key, titulo_ventana, pregunta, guia_paso1, guia_paso2, guia_paso3)
+_WIZARD_STEPS = [
+    (
+        "TELEGRAM_API_ID",
+        "Paso 1 de 3 — API ID",
+        "¿Cual es tu Telegram API ID?",
+        "1. Abre tu navegador y ve a:  https://my.telegram.org",
+        "2. Inicia sesion con tu numero de telefono de Telegram.",
+        "3. Haz clic en 'API development tools' y copia el numero que dice 'App api_id'.",
+    ),
+    (
+        "TELEGRAM_API_HASH",
+        "Paso 2 de 3 — API Hash",
+        "¿Cual es tu Telegram API Hash?",
+        "1. En la misma pagina (https://my.telegram.org → API development tools)",
+        "2. Copia el texto largo que dice 'App api_hash'.",
+        "3. Es una cadena de letras y numeros, como: 47fcb5d5e814de2817d1bdfb9940d347",
+    ),
+    (
+        "TELEGRAM_SOURCE_CHATS",
+        "Paso 3 de 3 — Canal de senales",
+        "¿Cual es el canal de Telegram con las senales?",
+        "1. Abre Telegram y busca el canal que envia las senales.",
+        "2. Haz clic derecho en el canal → 'Copiar enlace' o anota su @usuario.",
+        "3. Pega aqui el enlace o escribe el @usuario. Ej: @viptradercanal",
+    ),
+]
+
+
+def _show_config_wizard() -> None:
+    """Wizard paso a paso: una ventana por campo, con guia visual."""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except ImportError:
+        print("tkinter no disponible. Edita el archivo .env manualmente.")
+        return
+
+    existing = _read_env_existing()
+    collected: dict = {}
+    cancelled = [False]
+
+    def center(win: "tk.Tk | tk.Toplevel", w: int, h: int) -> None:
+        win.update_idletasks()
+        x = (win.winfo_screenwidth() - w) // 2
+        y = (win.winfo_screenheight() - h) // 2
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+    def show_step(index: int) -> None:
+        if index >= len(_WIZARD_STEPS):
+            # Todos los pasos completados → guardar
+            try:
+                _save_env_values(collected)
+                messagebox.showinfo(
+                    "¡Listo!",
+                    "Configuracion guardada correctamente.\nEl bot se iniciara ahora.",
+                )
+            except Exception as exc:
+                messagebox.showerror(
+                    "Error al guardar",
+                    f"No se pudo guardar la configuracion.\n\nDetalle: {exc}",
+                )
+            return
+
+        key, titulo, pregunta, guia1, guia2, guia3 = _WIZARD_STEPS[index]
+
+        win = tk.Tk() if index == 0 else tk.Toplevel()
+        win.title(f"Pocket Option Bot — {titulo}")
+        win.resizable(False, False)
+        win.grab_set()
+        center(win, 500, 340)
+
+        # Barra de progreso visual
+        bar_frame = tk.Frame(win, bg="#e0e0e0", height=6)
+        bar_frame.pack(fill="x")
+        fill_pct = int((index / len(_WIZARD_STEPS)) * 100)
+        tk.Frame(bar_frame, bg="#2196F3", height=6, width=int(500 * (index / len(_WIZARD_STEPS)))).place(x=0, y=0)
+
+        # Encabezado
+        tk.Label(win, text=titulo, font=("Segoe UI", 11, "bold"), fg="#1565C0").pack(pady=(16, 2))
+        tk.Label(win, text=pregunta, font=("Segoe UI", 13), wraplength=440, justify="center").pack(pady=(0, 10))
+
+        # Caja de guia
+        guide_frame = tk.Frame(win, bg="#F3F6FB", bd=1, relief="solid")
+        guide_frame.pack(padx=24, fill="x", pady=(0, 10))
+        tk.Label(guide_frame, text="Como obtenerlo:", font=("Segoe UI", 8, "bold"), bg="#F3F6FB", fg="#1565C0", anchor="w").pack(fill="x", padx=10, pady=(8, 2))
+        for guia in (guia1, guia2, guia3):
+            tk.Label(guide_frame, text=guia, font=("Segoe UI", 8), bg="#F3F6FB", fg="#333",
+                     anchor="w", wraplength=440, justify="left").pack(fill="x", padx=10, pady=1)
+        tk.Label(guide_frame, text="", bg="#F3F6FB").pack(pady=3)
+
+        # Campo de entrada
+        entry_frame = tk.Frame(win)
+        entry_frame.pack(padx=24, fill="x", pady=(0, 4))
+        entry = tk.Entry(entry_frame, font=("Segoe UI", 11), relief="solid", bd=1)
+        entry.insert(0, existing.get(key, ""))
+        entry.pack(fill="x", ipady=5)
+        entry.focus_set()
+
+        # Botones
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(pady=14)
+
+        def on_next(ev=None):
+            val = entry.get().strip()
+            if not val:
+                messagebox.showwarning("Campo vacio", "Por favor completa este campo antes de continuar.", parent=win)
+                return
+            collected[key] = val
+            win.destroy()
+            show_step(index + 1)
+
+        def on_cancel():
+            cancelled[0] = True
+            win.destroy()
+
+        if index > 0:
+            tk.Button(btn_frame, text="← Atras", font=("Segoe UI", 9),
+                      padx=12, pady=5, relief="flat", bg="#e0e0e0", cursor="hand2",
+                      command=on_cancel).pack(side="left", padx=6)
+
+        tk.Button(btn_frame,
+                  text="Siguiente →" if index < len(_WIZARD_STEPS) - 1 else "Guardar y continuar ✓",
+                  font=("Segoe UI", 10, "bold"), padx=18, pady=6,
+                  relief="flat", bg="#2196F3", fg="white", cursor="hand2",
+                  command=on_next).pack(side="left", padx=6)
+
+        win.bind("<Return>", on_next)
+        win.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        if index == 0:
+            win.mainloop()
+        else:
+            win.wait_window()
+
+    show_step(0)
+
+
 if __name__ == "__main__":
+    # Wizard de configuracion si faltan credenciales
+    if _env_needs_setup():
+        _show_config_wizard()
+    _ensure_playwright_browsers()
     release_lock = _acquire_single_instance_lock()
     _blackbox.start()
     external_interrupt_recoveries = 0
