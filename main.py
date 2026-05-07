@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from src.config.settings import AppSettings
 from src.core.engine import SignalEngine
 from src.core.models import TradingSignal
-from src.core.pipeline import MessageQueue, SignalProcessor, StateManager, GlobalGaleState
+from src.core.pipeline import MessageQueue, SignalProcessor, StateManager, GlobalGaleState, MasanielloSessionState, RecoveryProfile
 from src.pocket_option.client import PocketOptionDemoClient
 from src.utils.blackbox import DeferredBlackBoxRecorder, ShutdownSnapshot
 from src.utils.logger import setup_logging
@@ -237,6 +237,34 @@ async def run() -> None:
         _blackbox.record("telegram_pipeline_init", component="main")
         state_manager = StateManager(dedupe_ttl_seconds=settings.message_dedupe_ttl_seconds)
         global_gale_state = GlobalGaleState(profit_target=2.0)
+        masaniello_session = MasanielloSessionState(
+            n_ops=settings.masaniello_n_ops,
+            w_needed=settings.masaniello_w_needed,
+            base_balance=settings.masaniello_base_balance,
+            payout_mult=settings.calc_payout_percent / 100.0 + 1.0,
+        )
+        # RecoveryProfile: g1/g2 desde .env; si vacios, calculo automatico desde payout.
+        # Congelado al inicio — NO se recalcula en tiempo real.
+        _payout_net = settings.calc_payout_percent / 100.0
+        _auto_g1 = round((1.0 + _payout_net) / _payout_net, 4)
+        _auto_g2 = round(_auto_g1 * _auto_g1, 4)
+        recovery_profile = RecoveryProfile(
+            g1_mult=settings.recovery_g1_mult if settings.recovery_g1_mult > 0.0 else _auto_g1,
+            g2_mult=settings.recovery_g2_mult if settings.recovery_g2_mult > 0.0 else _auto_g2,
+            max_trade_pct=settings.max_trade_pct,
+            max_total_exposure_pct=settings.max_total_exposure_pct,
+        )
+        logging.info(
+            "[RECOVERY_PROFILE] base_calc=%.2f g1_mult=%.4f g2_mult=%.4f "
+            "max_trade_pct=%.2f%% max_total_exposure_pct=%.2f%% "
+            "(g1/g2 fuente: %s)",
+            settings.calc_base_balance,
+            recovery_profile.g1_mult,
+            recovery_profile.g2_mult,
+            recovery_profile.max_trade_pct * 100,
+            recovery_profile.max_total_exposure_pct * 100,
+            ".env" if settings.recovery_g1_mult > 0.0 else "auto-payout",
+        )
         message_queue = MessageQueue(maxsize=settings.processing_queue_maxsize)
         parser = SignalParser(
             default_amount=settings.default_amount,
@@ -269,6 +297,9 @@ async def run() -> None:
             color_output=settings.color_output,
             signal_late_tolerance_seconds=settings.signal_late_tolerance_seconds,
             global_gale_state=global_gale_state,
+            masaniello_session=masaniello_session,
+            recovery_profile=recovery_profile,
+            calc_base_balance=settings.calc_base_balance,
             event_recorder=_blackbox.record,
         )
         processor = SignalProcessor(
@@ -282,6 +313,8 @@ async def run() -> None:
             single_asset_mode=settings.single_asset_mode,
             override_asset=settings.override_asset,
             override_side=settings.override_side,
+            max_trade_pct=settings.max_trade_pct,
+            max_total_exposure_pct=settings.max_total_exposure_pct,
             event_recorder=_blackbox.record,
             fatal_error_handler=_on_signal_processor_fatal_error,
         )

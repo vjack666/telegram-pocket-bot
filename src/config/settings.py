@@ -54,6 +54,15 @@ class AppSettings:
     message_dedupe_ttl_seconds: int
     busy_policy: str
     telegram_channel_names: Dict[str, str]  # raw_chat -> display name
+    masaniello_n_ops: int
+    masaniello_w_needed: int
+    masaniello_base_balance: float
+    # ── Sizing global ──────────────────────────────────────────────────────
+    max_trade_pct: float          # cap por operación: ej 0.10 = 10% de base
+    max_total_exposure_pct: float # cap exposición total — placeholder RiskEngine
+    calc_base_balance: float      # balance fijo para calculator (base fija)
+    recovery_g1_mult: float       # 0.0 = auto desde payout
+    recovery_g2_mult: float       # 0.0 = auto desde payout
 
     @staticmethod
     def load() -> "AppSettings":
@@ -139,6 +148,14 @@ class AppSettings:
             telegram_channel_names=_parse_channel_names(
                 os.getenv("TELEGRAM_CHANNEL_NAMES", "")
             ),
+            masaniello_n_ops=int(os.getenv("APP_MASANIELLO_N_OPS", "12")),
+            masaniello_w_needed=int(os.getenv("APP_MASANIELLO_W_NEEDED", "4")),
+            masaniello_base_balance=float(os.getenv("APP_MASANIELLO_BASE_BALANCE", "300")),
+            max_trade_pct=float(os.getenv("APP_MAX_TRADE_PCT", "0.10")),
+            max_total_exposure_pct=float(os.getenv("APP_MAX_TOTAL_EXPOSURE_PCT", "0.25")),
+            calc_base_balance=float(os.getenv("APP_CALC_BASE_BALANCE", "300")),
+            recovery_g1_mult=float(os.getenv("APP_RECOVERY_G1_MULT", "").strip() or "0"),
+            recovery_g2_mult=float(os.getenv("APP_RECOVERY_G2_MULT", "").strip() or "0"),
         )
 
 
