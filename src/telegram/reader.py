@@ -17,6 +17,8 @@ MessageHandler = Callable[[TelegramInboundMessage], Awaitable[None]]
 
 # Intervalo del ping keep-alive (segundos)
 _KEEP_ALIVE_INTERVAL = 60
+# Reinicio suave periódico opcional (0 = deshabilitado)
+_PERIODIC_SOFT_RECONNECT_SECONDS = 0
 # Tiempo máximo de espera entre reintentos de reconexión (segundos)
 _MAX_RETRY_SECONDS = 30
 _INVITE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", re.IGNORECASE)
@@ -66,6 +68,9 @@ class TelegramSignalReader:
         self._restart_after_signal = restart_after_signal
         self._reconnect_lock = asyncio.Lock()
         self._last_forced_reconnect_ts = 0.0
+        self._planned_disconnect_reason: str | None = None
+        self._last_periodic_soft_reconnect_ts = time.monotonic()
+        self._backfill_done_once = False
         # chat_id (int) -> display name resuelto en tiempo de ejecución
         self._id_to_name: Dict[int, str] = {}
         # Tareas de despacho al pipeline para no bloquear el handler de Telethon
@@ -130,10 +135,16 @@ class TelegramSignalReader:
             self._last_forced_reconnect_ts = now_ts
 
             logging.info("Telegram: reinicio suave de conexion (%s)", reason)
+            did_disconnect = False
             try:
+                self._planned_disconnect_reason = reason
                 await self._disconnect_with_timeout(timeout_seconds=2.0)
+                did_disconnect = True
             except Exception as exc:
                 logging.debug("Telegram: fallo reinicio suave (%s)", exc)
+            finally:
+                if not did_disconnect and self._client.is_connected():
+                    self._planned_disconnect_reason = None
 
     async def run(
         self,
@@ -175,7 +186,8 @@ class TelegramSignalReader:
             while not shutdown_event.is_set():
                 try:
                     logging.info("Telegram: conectado. Escuchando señales...")
-                    if self._backfill_minutes > 0:
+                    if self._backfill_minutes > 0 and not self._backfill_done_once:
+                        self._backfill_done_once = True
                         asyncio.create_task(
                             self._process_recent_messages(on_message, resolved_chats),
                             name="telegram-backfill",
@@ -219,7 +231,12 @@ class TelegramSignalReader:
                         break
                     
                     # run_until_disconnected() retornó limpiamente
-                    logging.warning("Telegram: desconectado inesperadamente")
+                    planned_reason = self._planned_disconnect_reason
+                    self._planned_disconnect_reason = None
+                    if planned_reason:
+                        logging.info("Telegram: desconexion controlada (%s)", planned_reason)
+                    else:
+                        logging.warning("Telegram: desconectado inesperadamente")
 
                 except asyncio.CancelledError:
                     if shutdown_event.is_set():
@@ -366,11 +383,17 @@ class TelegramSignalReader:
             try:
                 await self._client.get_me()
                 logging.debug("Telegram keep-alive: OK")
-                # Reconexion periodica para refrescar sesion y evitar degradacion de entrega.
-                await self._force_soft_reconnect(
-                    shutdown_event,
-                    reason=f"periodic_{_KEEP_ALIVE_INTERVAL}s",
-                )
+                if _PERIODIC_SOFT_RECONNECT_SECONDS > 0:
+                    now_ts = time.monotonic()
+                    if (
+                        now_ts - self._last_periodic_soft_reconnect_ts
+                        >= _PERIODIC_SOFT_RECONNECT_SECONDS
+                    ):
+                        self._last_periodic_soft_reconnect_ts = now_ts
+                        await self._force_soft_reconnect(
+                            shutdown_event,
+                            reason=f"periodic_{_PERIODIC_SOFT_RECONNECT_SECONDS}s",
+                        )
             except Exception as exc:
                 logging.warning("Telegram keep-alive: ping fallido (%s)", exc)
 

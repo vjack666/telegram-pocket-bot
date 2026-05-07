@@ -20,6 +20,7 @@ class C:
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_COUNTDOWN_ACTIVE = False
 
 
 def _w() -> int:
@@ -62,7 +63,14 @@ def clear_screen() -> None:
 
 
 def clear_countdown_line() -> None:
+    global _COUNTDOWN_ACTIVE
     print("\r" + " " * _w() + "\r", end="", flush=True)
+    _COUNTDOWN_ACTIVE = False
+
+
+def clear_countdown_line_if_active() -> None:
+    if _COUNTDOWN_ACTIVE:
+        clear_countdown_line()
 
 
 def print_signal_summary(
@@ -144,6 +152,7 @@ def print_countdown_line(
     semaphore: str,
     color_output: bool = True,
 ) -> None:
+    global _COUNTDOWN_ACTIVE
     if color_output:
         step_col = _paint(f"[{step_name}]", C.BOLD, C.YELLOW)
         asset_col = _paint(asset, C.CYAN)
@@ -160,6 +169,7 @@ def print_countdown_line(
 
     pad = max(0, _w() - len(_strip_ansi(line)) - 1)
     print(line + " " * pad, end="", flush=True)
+    _COUNTDOWN_ACTIVE = True
 
 
 def print_order_event(
