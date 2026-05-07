@@ -4,6 +4,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, cast
 
 from telethon import TelegramClient, events
@@ -11,6 +12,25 @@ from telethon.errors import InviteHashExpiredError, InviteHashInvalidError, User
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon.utils import get_peer_id
 from src.telegram.message_types import TelegramInboundMessage
+
+# ── Archivo de historial de señales ──────────────────────────────────────
+_HISTORY_FILE = Path(__file__).resolve().parents[2] / "ejemplo.md"
+
+
+def _append_to_history(envelope: TelegramInboundMessage) -> None:
+    """Agrega todos los mensajes del canal al archivo ejemplo.md."""
+    try:
+        ts = envelope.message_date_utc.astimezone(
+            timezone(timedelta(hours=-3))  # UTC-3 (Argentina)
+        )
+        ts_str = ts.strftime("%d/%m/%Y %H:%M:%S")
+        canal  = envelope.source_name or str(envelope.chat_id)
+        entry  = f"[{ts_str}] {canal}: {envelope.text}\n\n"
+        with _HISTORY_FILE.open("a", encoding="utf-8") as f:
+            f.write(entry)
+        logging.info("Historial actualizado: [%s] %s", ts_str, envelope.text[:60])
+    except Exception as exc:
+        logging.warning("No se pudo guardar en historial: %s", exc)
 
 
 MessageHandler = Callable[[TelegramInboundMessage], Awaitable[None]]
@@ -358,6 +378,7 @@ class TelegramSignalReader:
                 received_at_utc=now_utc,
                 source_name=source_name,
             )
+            _append_to_history(envelope)
             self._schedule_dispatch(on_message, envelope)
 
             if self._restart_after_signal:

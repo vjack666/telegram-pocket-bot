@@ -1,13 +1,16 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from src.core.models import TradingSignal
 from src.core.console_hub import clear_countdown_line, print_countdown_line, print_order_event, print_signal_summary
 from src.pocket_option.assets import canonicalize_pocket_asset, normalize_asset_for_compare
 from src.pocket_option.client import PocketOptionBaseClient
 from src.pocket_option.trade_panel_feed import LiveTradeSnapshot
+from src.core.pipeline import MasanielloSessionState, RecoveryProfile
+from src.core.equity_bands import EquityBandManager
+from src.core.daily_profit_tracker import DailyProfitTracker
 
 
 class SignalEngine:
@@ -25,11 +28,17 @@ class SignalEngine:
         color_output: bool,
         signal_late_tolerance_seconds: int,
         global_gale_state: Any,
+        masaniello_session: MasanielloSessionState | None = None,
+        recovery_profile: RecoveryProfile | None = None,
+        calc_base_balance: float = 300.0,
         event_recorder: Callable[..., None] | None = None,
+        equity_manager: Optional[EquityBandManager] = None,
+        daily_profit_tracker: Optional[DailyProfitTracker] = None,
     ) -> None:
         self._pocket_client = pocket_client
         self._martingale_amounts = [value for value in martingale_amounts if value > 0] or [2.0, 4.0, 10.0]
-        self._martingale_mode = martingale_mode if martingale_mode in {"fixed", "calculator"} else "fixed"
+        self._martingale_mode = martingale_mode if martingale_mode in {"fixed", "calculator", "masaniello"} else "fixed"
+        self._masaniello_session = masaniello_session
         self._calc_payout = max(0.01, calc_payout_percent / 100.0)
         self._calc_increment = max(1, calc_increment)
         self._calc_rule10_threshold = max(0.0, calc_rule10_balance_threshold)
@@ -42,10 +51,23 @@ class SignalEngine:
         self._martingale_prepare_lead_seconds = 30.0
         self._martingale_send_lead_seconds = 0.2
         self._max_entry_delay_seconds = 10.0
-        self._max_operation_balance_ratio = 0.10
+        self._calc_base_balance = max(1.0, calc_base_balance)
+        # RecoveryProfile: si no se pasa uno, construir defaults seguros desde payout
+        if recovery_profile is None:
+            full_pm = 1.0 + self._calc_payout
+            auto_g1 = round(full_pm / self._calc_payout, 4)
+            recovery_profile = RecoveryProfile(
+                g1_mult=auto_g1,
+                g2_mult=round(auto_g1 * auto_g1, 4),
+                max_trade_pct=0.10,
+                max_total_exposure_pct=0.25,
+            )
+        self._recovery_profile = recovery_profile
         self._global_gale = global_gale_state
         self._event_recorder = event_recorder
         self._last_known_balance: float | None = None
+        self._equity_manager: Optional[EquityBandManager] = equity_manager
+        self._daily_profit_tracker: Optional[DailyProfitTracker] = daily_profit_tracker
         # CRITICAL FIX: Broker-level lock to serialize all browser operations
         self._broker_lock = asyncio.Lock()
 
@@ -92,6 +114,50 @@ class SignalEngine:
         )
 
         await self._execute_step_chain(signal, cycle_amounts, entry_times, step_idx=start_step)
+
+        # Actualizar capital operativo dinámico tras cada ciclo completo
+        await self._apply_equity_update()
+
+    async def _apply_equity_update(self) -> None:
+        """Lee el balance actual y notifica al EquityBandManager.
+
+        Si la banda cambia, sincroniza _calc_base_balance y la base de
+        MasanielloSessionState para que el próximo ciclo use el sizing correcto.
+        """
+        if self._equity_manager is None:
+            return
+        try:
+            balance = await self._safe_get_balance()
+        except Exception as exc:
+            logging.warning("[EquityBands] No se pudo leer balance para actualización: %s", exc)
+            return
+
+        changed = self._equity_manager.notify_balance(balance)
+        if changed:
+            new_base = self._equity_manager.operational_base
+            self._calc_base_balance = new_base
+            if self._masaniello_session is not None:
+                self._masaniello_session.update_base(new_base)
+            self._emit_event(
+                "equity_band_changed",
+                balance=balance,
+                new_operational_base=new_base,
+                daily_target=self._equity_manager.daily_target,
+                **self._equity_manager.status(),
+            )
+            logging.info(
+                "[EquityBands] Base operativa actualizada → %.2f | "
+                "meta_diaria=%.2f | balance=%.2f",
+                new_base,
+                self._equity_manager.daily_target,
+                balance,
+            )
+        else:
+            logging.debug(
+                "[EquityBands] Sin cambio de banda (balance=%.2f base=%.2f)",
+                balance,
+                self._equity_manager.operational_base,
+            )
 
     async def _execute_step_chain(
         self,
@@ -147,6 +213,18 @@ class SignalEngine:
             if won:
                 logging.info("Resultado: WIN en %s. Se detiene martingala.", step_name)
                 self._global_gale.record_win()
+                if self._masaniello_session is not None:
+                    self._masaniello_session.record_win()
+                
+                # Registrar en daily profit tracker
+                pnl_win = round(amount * self._calc_payout, 2)
+                if self._daily_profit_tracker is not None:
+                    tracker_status = self._daily_profit_tracker.record_trade(pnl_win)
+                    self._emit_event("daily_profit_update", **tracker_status)
+                    if tracker_status.get("meta_just_reached"):
+                        logging.info("[Daily Meta] ✓ META ALCANZADA: $%.2f | Modo DEFENSIVO activado", 
+                                   tracker_status.get("daily_pnl", 0))
+                
                 self._emit_event(
                     "trade_result_win",
                     asset=signal.asset,
@@ -167,6 +245,21 @@ class SignalEngine:
             else:
                 logging.warning("Resultado: LOSS en %s. Gale continuará en siguiente señal.", step_name)
                 self._global_gale.record_loss(amount)
+                if self._masaniello_session is not None:
+                    self._masaniello_session.record_loss()
+                
+                # Registrar en daily profit tracker (pérdida)
+                pnl_loss = round(-amount, 2)
+                if self._daily_profit_tracker is not None:
+                    tracker_status = self._daily_profit_tracker.record_trade(pnl_loss)
+                    self._emit_event("daily_profit_update", **tracker_status)
+                    # Log del progreso hacia la meta
+                    logging.info("[Daily Meta] Progreso: $%.2f / $%.2f (%.1f%%) | Modo: %s",
+                               tracker_status.get("daily_pnl", 0),
+                               tracker_status.get("daily_target", 0),
+                               tracker_status.get("progress_pct", 0),
+                               "DEFENSIVO" if tracker_status.get("defensive_mode") else "NORMAL")
+                
                 self._emit_event(
                     "trade_result_loss",
                     asset=signal.asset,
@@ -368,6 +461,8 @@ class SignalEngine:
         if won:
             logging.info("Resultado: WIN en %s. Se detiene martingala.", current_step_name)
             self._global_gale.record_win()
+            if self._masaniello_session is not None:
+                self._masaniello_session.record_win()
             self._emit_event(
                 "trade_result_win",
                 asset=signal.asset,
@@ -389,6 +484,8 @@ class SignalEngine:
 
         logging.info("%s cerro en LOSS. Continuando con %s.", current_step_name, next_step_name)
         # Registrar LOSS en el estado global antes de continuar al siguiente paso
+        # Nota: NO se registra en MasanielloSession aqui — es un paso intermedio.
+        # Solo se registra como LOSS de señal cuando es_last=True en _execute_step_chain.
         self._global_gale.record_loss(current_amount)
         try:
             if next_prepared:
@@ -902,79 +999,101 @@ class SignalEngine:
         return f"{local.strftime('%H:%M:%S')} UTC{offset_hours:+d}"
 
     def _build_cycle_amounts(self, current_balance: float) -> list[float]:
+        if self._martingale_mode == "masaniello" and self._masaniello_session is not None:
+            return self._masaniello_amounts(current_balance)
         if self._martingale_mode != "calculator":
             return list(self._martingale_amounts)
         return self._calculator_amounts(current_balance)
 
+    def _masaniello_amounts(self, current_balance: float) -> list[float]:
+        """Calcula [entry, G1, G2] usando la formula Masaniello para el estado actual de sesion.
+
+        Cap: usa base fija del Masaniello (no balance en tiempo real) para evitar
+        escalado accidental. Cap se aplica ANTES del round en todos los pasos.
+        """
+        assert self._masaniello_session is not None
+        entry = self._masaniello_session.current_entry_stake()
+        base = self._masaniello_session._base_balance
+        cap = round(max(0.01, base * self._recovery_profile.max_trade_pct), 2)
+        g1_mult = self._recovery_profile.g1_mult
+        g2_mult = self._recovery_profile.g2_mult
+
+        # Cap antes de round en TODOS los pasos
+        amounts = [
+            round(min(entry, cap), 2),
+            round(min(entry * g1_mult, cap), 2),
+            round(min(entry * g2_mult, cap), 2),
+        ]
+        cap_active = any(v > cap for v in [entry, entry * g1_mult, entry * g2_mult])
+        logging.info(
+            "Masaniello %d/%d: señal %d/%d wins=%d losses=%d entry=%.2f "
+            "cap=%.2f(%.0f%%) g1x=%.4f g2x=%.4f amounts=%s%s",
+            self._masaniello_session._n_ops,
+            self._masaniello_session._w_needed,
+            self._masaniello_session.signals_consumed + 1,
+            self._masaniello_session._n_ops,
+            self._masaniello_session.wins,
+            self._masaniello_session.losses,
+            entry,
+            cap,
+            self._recovery_profile.max_trade_pct * 100,
+            g1_mult,
+            g2_mult,
+            amounts,
+            " [CAP ACTIVO]" if cap_active else "",
+        )
+        return amounts
+
     def _calculator_amounts(self, start_balance: float) -> list[float]:
-        # Con gale global, siempre calculamos desde el balance de inicio del ciclo
-        # y con target fijo de +$2 desde ese punto, sin importar pérdidas acumuladas
+        """Calcula [entry, G1, G2] para el modo calculator.
+
+        - Base fija: usa self._calc_base_balance (no el balance real) para el cap
+          y para el target en modo normal. Elimina balance inflation y escalado
+          accidental por crecimiento de cuenta.
+        - RecoveryProfile: los multiplicadores g1_mult/g2_mult determinan G1/G2.
+          El calculator conserva su propia filosofía de entry (target-based);
+          solo usa los mults para los gales, NO es Masaniello.
+        - Cap antes de round en TODOS los pasos (entry, G1, G2).
+        """
+        base = self._calc_base_balance
+        cap = round(max(0.01, base * self._recovery_profile.max_trade_pct), 2)
+
         if self._global_gale.is_active:
             cycle_start = self._global_gale.cycle_start_balance
             accumulated_loss = self._global_gale.accumulated_loss
-            balance = max(0.0, cycle_start - accumulated_loss)
-            target = cycle_start + 2.0  # Target fijo de +$2 desde inicio del ciclo
+            effective = max(0.0, cycle_start - accumulated_loss)
+            target = cycle_start + 2.0
             logging.info(
-                "Calculator modo gale global: cycle_start=%.2f accumulated_loss=%.2f balance_actual=%.2f target=%.2f",
-                cycle_start,
-                accumulated_loss,
-                balance,
-                target,
+                "Calculator gale global: cycle_start=%.2f loss=%.2f effective=%.2f target=%.2f cap=%.2f",
+                cycle_start, accumulated_loss, effective, target, cap,
             )
         else:
-            balance = max(0.0, start_balance)
-            target = float(balance.__floor__() + self._calc_increment)
+            effective = base
+            target = float(base.__floor__() + self._calc_increment)
             logging.info(
-                "Calculator modo normal: balance=%.2f target=%.2f",
-                balance,
-                target,
+                "Calculator normal: base=%.2f target=%.2f cap=%.2f(%.0f%%)",
+                base, target, cap, self._recovery_profile.max_trade_pct * 100,
             )
-        
-        losses = 0
-        amounts: list[float] = []
-        # Tope fijo por señal: no gastar más del 10% de la cuenta por operación.
-        risk_cap = round(max(0.01, start_balance * self._max_operation_balance_ratio), 2)
-        cap_reached = False
 
-        for _ in range(self._calc_max_steps):
-            if cap_reached:
-                amount = risk_cap
-            else:
-                needed_profit = max(0.0, target - balance)
-                amount = needed_profit / self._calc_payout
-                if amount <= 0:
-                    amount = 0.01
-                amount = round(max(0.01, amount), 2)
+        needed = max(0.0, target - effective)
+        entry = needed / self._calc_payout if self._calc_payout > 0 else 0.01
+        entry = max(0.01, entry)
 
-                if amount > risk_cap:
-                    logging.info(
-                        "Regla 10%% aplicada: monto_calculado=%.2f tope_fijo=%.2f. Se mantiene monto plano.",
-                        amount,
-                        risk_cap,
-                    )
-                    amount = risk_cap
-                    cap_reached = True
+        g1 = entry * self._recovery_profile.g1_mult
+        g2 = entry * self._recovery_profile.g2_mult
 
-            amounts.append(amount)
+        # Cap antes de round en todos los pasos
+        raw = [entry, g1, g2]
+        amounts = [round(min(v, cap), 2) for v in raw[: self._calc_max_steps]]
 
-            balance = max(0.0, balance - amount)
-            losses += 1
-
-            # Reglas especiales solo en modo normal (no en gale global)
-            if not self._global_gale.is_active:
-                if balance <= self._calc_rule10_threshold and losses >= 3:
-                    losses = 0
-                    target = float(balance.__floor__() + self._calc_increment)
-                    continue
-
-                if balance > self._calc_rule10_threshold:
-                    next_needed = max(0.0, target - balance)
-                    next_amount = next_needed / self._calc_payout if self._calc_payout > 0 else 0.0
-                    risk_limit = float(int(balance * 0.10))
-                    if round(next_amount) >= risk_limit and risk_limit > 0:
-                        losses = 0
-                        target = float(balance.__floor__() + self._calc_increment)
-
+        cap_hit = [v > cap for v in raw[: self._calc_max_steps]]
+        if any(cap_hit):
+            logging.info(
+                "Calculator cap %.0f%% activado: raw=%s → amounts=%s",
+                self._recovery_profile.max_trade_pct * 100,
+                [round(v, 2) for v in raw[: self._calc_max_steps]],
+                amounts,
+            )
         return amounts
 
     @staticmethod

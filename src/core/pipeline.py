@@ -129,6 +129,152 @@ class StateManager:
             self._seen.pop(oldest, None)
 
 
+@dataclass(frozen=True)
+class RecoveryProfile:
+    """Perfil de sizing/recovery configurable, independiente del modo operativo.
+
+    Aplica el cap de exposición a TODOS los pasos (entrada, G1, G2) en
+    todos los modos. Los multiplicadores g1_mult / g2_mult son usados por
+    el modo 'calculator'; Masaniello los usa solo como referencia de gale.
+
+    Regla de cap: siempre min(raw_stake, cap) ANTES de round(), para
+    evitar excesos por rounding.
+    """
+
+    g1_mult: float             # multiplicador de G1 sobre entrada
+    g2_mult: float             # multiplicador de G2 sobre entrada
+    max_trade_pct: float       # cap por operación individual (ej: 0.10 = 10%)
+    max_total_exposure_pct: float  # cap de exposición acumulada — reservado para RiskEngine futuro
+
+
+class MasanielloSessionState:
+    """Tracks Masaniello session state across signals.
+
+    Una sesion = N_OPS señales. La sesion se considera ganada cuando
+    se acumulan W_NEEDED victorias. Al finalizar (wins >= W o
+    signals >= N), la sesion se reinicia automaticamente.
+    La apuesta de entrada de cada señal se calcula con la formula
+    de Masaniello usando el balance base fijo de $300.
+    """
+
+    def __init__(
+        self,
+        n_ops: int = 12,
+        w_needed: int = 4,
+        base_balance: float = 300.0,
+        payout_mult: float = 1.92,
+    ) -> None:
+        self._n_ops = max(1, n_ops)
+        self._w_needed = max(1, w_needed)
+        self._base_balance = max(1.0, base_balance)
+        self._payout_mult = max(1.01, payout_mult)
+        self._wins: int = 0
+        self._losses: int = 0
+
+    @property
+    def wins(self) -> int:
+        return self._wins
+
+    @property
+    def losses(self) -> int:
+        return self._losses
+
+    @property
+    def signals_consumed(self) -> int:
+        return self._wins + self._losses
+
+    @property
+    def is_session_over(self) -> bool:
+        return self._wins >= self._w_needed or self.signals_consumed >= self._n_ops
+
+    def current_entry_stake(self) -> float:
+        """Devuelve la apuesta de entrada Masaniello para el estado actual."""
+        return self._masaniello_stake(self._base_balance, self._losses, self._wins)
+
+    def record_win(self) -> None:
+        """Registra una victoria de señal (WD, G1 o G2). Reinicia sesion si completa."""
+        self._wins += 1
+        logging.info(
+            "MasanielloSession WIN: wins=%d losses=%d consumed=%d/%d",
+            self._wins,
+            self._losses,
+            self.signals_consumed,
+            self._n_ops,
+        )
+        if self.is_session_over:
+            logging.info(
+                "MasanielloSession: sesion COMPLETADA (wins=%d). Reiniciando.",
+                self._wins,
+            )
+            self._wins = 0
+            self._losses = 0
+
+    def record_loss(self) -> None:
+        """Registra una perdida de señal completa (L). Reinicia sesion si agotada."""
+        self._losses += 1
+        logging.info(
+            "MasanielloSession LOSS: wins=%d losses=%d consumed=%d/%d",
+            self._wins,
+            self._losses,
+            self.signals_consumed,
+            self._n_ops,
+        )
+        if self.is_session_over:
+            logging.info(
+                "MasanielloSession: sesion AGOTADA (losses=%d). Reiniciando.",
+                self._losses,
+            )
+            self._wins = 0
+            self._losses = 0
+
+    def update_base(self, new_base: float) -> None:
+        """Actualiza la base de sizing Masaniello (llamado por EquityBandManager)."""
+        new_base = max(1.0, new_base)
+        if new_base != self._base_balance:
+            logging.info(
+                "MasanielloSession base actualizada: %.2f → %.2f",
+                self._base_balance,
+                new_base,
+            )
+            self._base_balance = new_base
+
+    def _masaniello_stake(self, balance: float, losses_so_far: int, wins_so_far: int) -> float:
+        n = self._n_ops
+        w = self._w_needed
+        pm = self._payout_mult
+
+        ops_left = n - (losses_so_far + wins_so_far)
+        wins_left = w - wins_so_far
+
+        if ops_left <= 0 or wins_left <= 0 or wins_left > ops_left:
+            return 0.01
+
+        p_win_fwd = self._forward_prob(ops_left - 1, wins_left - 1, pm)
+        p_lose_fwd = self._forward_prob(ops_left - 1, wins_left, pm)
+
+        denom = p_win_fwd + (pm - 1) * p_lose_fwd
+        if denom == 0:
+            return balance
+
+        stake = balance * (1 - pm * p_win_fwd / denom)
+        return round(max(0.01, min(stake, balance)), 2)
+
+    @staticmethod
+    def _forward_prob(ops_left: int, wins_needed: int, payout_mult: float) -> float:
+        if wins_needed <= 0:
+            return 1.0
+        if wins_needed > ops_left:
+            return 0.0
+        if wins_needed == ops_left:
+            return payout_mult ** ops_left
+        p_win = MasanielloSessionState._forward_prob(ops_left - 1, wins_needed - 1, payout_mult)
+        p_lose = MasanielloSessionState._forward_prob(ops_left - 1, wins_needed, payout_mult)
+        denom = p_win + (payout_mult - 1) * p_lose
+        if denom == 0:
+            return 0.0
+        return payout_mult * p_win * p_lose / denom
+
+
 class GlobalGaleState:
     """Persistent martingale state that survives across all signals.
     Only resets on WIN. Always targets +$2 profit from cycle start balance."""
@@ -186,22 +332,18 @@ class GlobalGaleState:
     
     def reset_for_new_signal(self, current_balance: float) -> None:
         """Llamar al inicio de cada señal nueva.
-        - Siempre arranca en ENTRADA (step=0).
-        - Si hay pérdidas acumuladas de señales anteriores, las CONSERVA para el cálculo de montos.
-        - Solo reinicia todo al recibir un WIN.
+        Siempre reinicia el ciclo desde cero con $14 de entrada.
+        La deuda de señales anteriores NO se acumula entre señales.
+        Los gales dentro de cada señal se calculan al inicio de la misma.
         """
-        if self._is_active and self._accumulated_loss > 0:
-            # Hay pérdidas previas: mantener accumulated_loss y cycle_start para el calculador,
-            # pero resetear el paso para que la nueva señal empiece en ENTRADA.
-            self._current_step = 0
-            logging.info(
-                "GlobalGaleState: Nueva señal con pérdidas acumuladas=%.2f | step=0 | target=%.2f",
-                self._accumulated_loss,
-                self.target_balance,
-            )
-        else:
-            # Sin pérdidas previas: ciclo limpio
-            self.start_new_cycle(current_balance)
+        self._is_active = False
+        self._current_step = 0
+        self._cycle_start_balance = current_balance
+        self._accumulated_loss = 0.0
+        logging.info(
+            "GlobalGaleState: Nueva señal - ciclo fresco. balance=%.2f",
+            current_balance,
+        )
 
     def record_win(self) -> None:
         """Reset gale state after a WIN."""
@@ -229,6 +371,8 @@ class SignalProcessor:
         single_asset_mode: bool,
         override_asset: str = "",
         override_side: str | None = None,
+        max_trade_pct: float = 0.10,
+        max_total_exposure_pct: float = 0.25,
         event_recorder: Callable[..., None] | None = None,
         fatal_error_handler: Callable[[str], None] | None = None,
     ) -> None:
@@ -238,6 +382,8 @@ class SignalProcessor:
         self._state_manager = state_manager
         self._late_tolerance_seconds = max(0, late_tolerance_seconds)
         self._busy_policy = busy_policy if busy_policy in {"queue", "ignore_if_busy"} else "queue"
+        self._max_trade_pct = max(0.01, max_trade_pct)
+        self._max_total_exposure_pct = max(self._max_trade_pct, max_total_exposure_pct)
         self._channel_queues: dict[int, asyncio.Queue[QueuedSignal]] = {}
         self._channel_workers: dict[int, asyncio.Task] = {}
         self._channel_workers_lock = asyncio.Lock()
@@ -553,6 +699,20 @@ class SignalProcessor:
             self._state_manager.execution_active or total_pending > 0
         ):
             self._log_decision("ignorado_por_sistema_ocupado", envelope, msg_utc, ingress_utc, delay)
+            return
+
+        # Guard de exposición: si agregar esta señal superaría max_total_exposure_pct, la saltamos.
+        # Cálculo conservador: (señales activas + 1) × max_trade_pct.
+        projected_exposure = (self._state_manager.active_count + 1) * self._max_trade_pct
+        if projected_exposure > self._max_total_exposure_pct:
+            logging.warning(
+                "Guard exposicion: active=%d projected=%.0f%% limit=%.0f%% — señal descartada asset=%s",
+                self._state_manager.active_count,
+                projected_exposure * 100,
+                self._max_total_exposure_pct * 100,
+                signal.asset,
+            )
+            self._log_decision("ignorado_por_exposicion_maxima", envelope, msg_utc, ingress_utc, delay)
             return
 
         await self._enqueue_channel_signal(
