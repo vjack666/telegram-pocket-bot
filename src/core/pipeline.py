@@ -628,6 +628,15 @@ class SignalProcessor:
 
         signal = self._parser.parse(envelope.text, received_at_utc=ingress_utc)
         if signal is None:
+            if self._parser.is_result_message(envelope.text):
+                self._log_decision("ignorado_mensaje_resultado", envelope, msg_utc, ingress_utc, delay)
+                logging.info(
+                    "Mensaje de resultado detectado (no señal de entrada): msg_id=%s canal='%s' texto='%s'",
+                    envelope.message_id,
+                    envelope.source_name or str(envelope.chat_id),
+                    (envelope.text or "").replace("\n", " ")[:220],
+                )
+                return
             self._log_decision("ignorado_sin_senal", envelope, msg_utc, ingress_utc, delay)
             logging.info(
                 "Parser no detecto senal en msg_id=%s canal='%s' texto='%s'",

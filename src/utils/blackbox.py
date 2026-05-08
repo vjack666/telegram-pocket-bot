@@ -50,6 +50,14 @@ class BlackBoxRecorder:
         except Exception:
             pass
 
+    def _write_line(self, line: str) -> None:
+        """Escribe una línea en el .jsonl — siempre llamar desde un hilo, nunca desde el event loop."""
+        try:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+        except Exception:
+            self._safe_stderr("No se pudo escribir evento en blackbox")
+
     def record(self, event: str, **fields: Any) -> None:
         shutdown = self._current_shutdown()
         payload = {
@@ -60,13 +68,12 @@ class BlackBoxRecorder:
             "component": fields.pop("component", shutdown.component),
             **fields,
         }
+        line = json.dumps(payload, ensure_ascii=True) + "\n"
         with self._lock:
             self._events.append(payload)
-            try:
-                with self.path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
-            except Exception:
-                self._safe_stderr("No se pudo escribir evento en blackbox")
+        # Escribir en disco en un hilo de fondo para no bloquear el event loop.
+        t = threading.Thread(target=self._write_line, args=(line,), daemon=True)
+        t.start()
 
     def dump_summary(self, shutdown: dict[str, Any]) -> None:
         with self._lock:

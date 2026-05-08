@@ -36,6 +36,11 @@ class SignalEngine:
         event_recorder: Callable[..., None] | None = None,
         equity_manager: Optional[EquityBandManager] = None,
         daily_profit_tracker: Optional[DailyProfitTracker] = None,
+        watchdog_trigger: Callable[[], None] | None = None,
+        balance_scaling_step: float = 50.0,
+        session_base_increment: float | None = None,
+        session_base_growth_pct: float = 0.15,
+        session_base_max: float = 60.0,
     ) -> None:
         self._pocket_client = pocket_client
         self._martingale_amounts = [value for value in martingale_amounts if value > 0] or [2.0, 4.0, 10.0]
@@ -71,6 +76,14 @@ class SignalEngine:
         self._last_known_balance: float | None = None
         self._equity_manager: Optional[EquityBandManager] = equity_manager
         self._daily_profit_tracker: Optional[DailyProfitTracker] = daily_profit_tracker
+        self._watchdog_trigger: Callable[[], None] | None = watchdog_trigger
+        self._balance_scaling_step = max(1.0, float(balance_scaling_step))
+        self._session_base_increment = (
+            None if session_base_increment is None else max(0.01, float(session_base_increment))
+        )
+        self._session_base_growth_pct = max(0.0, float(session_base_growth_pct))
+        self._session_base_max = max(1.0, float(session_base_max))
+        self._scaling_anchor_balance: float | None = None
         self._ultimo_resultado: str | None = None
         self._next_entry_override: float | None = None
         if self._masaniello_manager is not None:
@@ -126,6 +139,7 @@ class SignalEngine:
 
         # Actualizar capital operativo dinámico tras cada ciclo completo
         await self._apply_equity_update()
+        await self.check_balance_scaling()
 
     async def _apply_equity_update(self) -> None:
         """Lee el balance actual y notifica al EquityBandManager.
@@ -252,6 +266,9 @@ class SignalEngine:
                     amount,
                     color_output=self._color_output,
                 )
+                # Watchdog: escaneo post-trade con delay de 5s
+                if self._watchdog_trigger is not None:
+                    self._watchdog_trigger()
             else:
                 logging.warning("Resultado: LOSS en %s. Gale continuará en siguiente señal.", step_name)
                 self._global_gale.record_loss(amount)
@@ -288,6 +305,9 @@ class SignalEngine:
                     amount,
                     color_output=self._color_output,
                 )
+                # Watchdog: escaneo post-trade con delay de 5s
+                if self._watchdog_trigger is not None:
+                    self._watchdog_trigger()
             return
 
         next_info = await self._monitor_and_arm_next_step(
@@ -1036,6 +1056,65 @@ class SignalEngine:
         self._next_entry_override = self._masaniello_manager.get_next_stake(self._ultimo_resultado)
         self._ultimo_resultado = None
         self._log_masaniello_next_entry(self._next_entry_override)
+
+    async def check_balance_scaling(self) -> None:
+        """Escala la base de sesion Masaniello por hitos de balance.
+
+        Regla:
+        - Cada +$50 desde el ancla inicial del proceso, sube +15% la base de sesion.
+        - Tope de base: $60.
+        """
+        if self._masaniello_manager is None:
+            return
+        try:
+            current_balance = await self._safe_get_balance()
+        except Exception as exc:
+            logging.debug("Scaling Masaniello: no se pudo leer balance (%s)", exc)
+            return
+
+        if self._scaling_anchor_balance is None:
+            self._scaling_anchor_balance = current_balance
+            return
+
+        growth = current_balance - self._scaling_anchor_balance
+        if growth < self._balance_scaling_step:
+            return
+
+        levels = int(growth // self._balance_scaling_step)
+        if self._session_base_increment is not None:
+            target_base = self._masaniello_manager.initial_session_base_capital + (
+                levels * self._session_base_increment
+            )
+        else:
+            growth_mult = (1.0 + self._session_base_growth_pct) ** levels
+            target_base = self._masaniello_manager.initial_session_base_capital * growth_mult
+        target_base = min(target_base, self._session_base_max)
+        prev_base = self._masaniello_manager.session_base_capital
+
+        if target_base <= prev_base:
+            return
+
+        if not self._masaniello_manager.set_session_base_capital(target_base):
+            return
+
+        # Fuerza recálculo inmediato para la próxima entrada con la nueva base.
+        self._next_entry_override = self._masaniello_manager.get_next_stake(None)
+        self._log_masaniello_next_entry(self._next_entry_override)
+
+        growth_msg = (
+            f"Nuevo hito alcanzado: Stake de sesion incrementado a ${target_base:.2f} "
+            f"(balance=${current_balance:.2f}, base_previa=${prev_base:.2f})"
+        )
+        logging.info(growth_msg)
+        self._emit_event(
+            "masaniello_scaling_hito",
+            message=growth_msg,
+            balance=current_balance,
+            growth=growth,
+            balance_step=self._balance_scaling_step,
+            base_previous=prev_base,
+            base_new=target_base,
+        )
 
     def _log_masaniello_next_entry(self, stake: float) -> None:
         if self._masaniello_manager is None:

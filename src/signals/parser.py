@@ -74,6 +74,10 @@ class SignalParser:
             r"MARTINGALA\s*(?:A\s*LAS)?\s*[:=]?\s*(\d{1,2})[:\.](\d{2})",
             re.IGNORECASE,
         )
+        self._result_message_re = re.compile(
+            r"\b(VICTORIA\s+DIRECTA|VICTORIA\s+EN\s+1(?:A|ª)?|VICTORIA\s+EN\s+2(?:A|ª)?|PERDIDA|P[EÉ]RDIDA|LOSS|WIN)\b",
+            re.IGNORECASE,
+        )
         # Códigos de moneda y cripto reconocidos. Cualquier par que no use
         # exclusivamente estos códigos se descarta como falso positivo.
         self._known_currencies = {
@@ -94,6 +98,10 @@ class SignalParser:
     def parse(self, raw_text: str, received_at_utc: datetime | None = None) -> Optional[TradingSignal]:
         text = (raw_text or "").strip()
         if not text:
+            return None
+
+        # Mensajes de resultado (WIN/LOSS) no son señales de entrada.
+        if self.is_result_message(text):
             return None
 
         received = received_at_utc or TradingSignal.now_utc()
@@ -160,6 +168,9 @@ class SignalParser:
             execute_at_utc=execute_at_utc,
             martingale_execute_at_utc=martingale_execute_at_utc,
         )
+
+    def is_result_message(self, raw_text: str) -> bool:
+        return self._result_message_re.search(_normalize_for_match(raw_text or "")) is not None
 
     @staticmethod
     def _normalize_side(raw_side: str) -> str:

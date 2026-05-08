@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import inspect
 import logging
 import re
@@ -17,8 +18,18 @@ from src.telegram.message_types import TelegramInboundMessage
 _HISTORY_FILE = Path(__file__).resolve().parents[2] / "ejemplo.md"
 
 
+def _write_history_line(entry: str, ts_str: str, preview: str) -> None:
+    """I/O síncrono de disco — ejecutar siempre en un executor, nunca en el event loop."""
+    try:
+        with _HISTORY_FILE.open("a", encoding="utf-8") as f:
+            f.write(entry)
+        logging.info("Historial actualizado: [%s] %s", ts_str, preview)
+    except Exception as exc:
+        logging.warning("No se pudo guardar en historial: %s", exc)
+
+
 def _append_to_history(envelope: TelegramInboundMessage) -> None:
-    """Agrega todos los mensajes del canal al archivo ejemplo.md."""
+    """Agenda la escritura a ejemplo.md en un hilo de fondo (no bloquea el event loop)."""
     try:
         ts = envelope.message_date_utc.astimezone(
             timezone(timedelta(hours=-3))  # UTC-3 (Argentina)
@@ -26,11 +37,15 @@ def _append_to_history(envelope: TelegramInboundMessage) -> None:
         ts_str = ts.strftime("%d/%m/%Y %H:%M:%S")
         canal  = envelope.source_name or str(envelope.chat_id)
         entry  = f"[{ts_str}] {canal}: {envelope.text}\n\n"
-        with _HISTORY_FILE.open("a", encoding="utf-8") as f:
-            f.write(entry)
-        logging.info("Historial actualizado: [%s] %s", ts_str, envelope.text[:60])
+        preview = envelope.text[:60]
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.run_in_executor(None, _write_history_line, entry, ts_str, preview)
+        else:
+            # Fallback si se llama fuera de un loop activo
+            _write_history_line(entry, ts_str, preview)
     except Exception as exc:
-        logging.warning("No se pudo guardar en historial: %s", exc)
+        logging.warning("No se pudo agendar escritura en historial: %s", exc)
 
 
 MessageHandler = Callable[[TelegramInboundMessage], Awaitable[None]]
@@ -97,6 +112,17 @@ class TelegramSignalReader:
         self._dispatch_tasks: set[asyncio.Task] = set()
         # Handlers registrados (solo se registran una vez)
         self._handlers_registered = False
+        # Watchdog: canales resueltos y callback de mensajes guardados al conectar
+        self._resolved_chats_cache: list[Any] = []
+        self._on_message_cache: MessageHandler | None = None
+        # Intervalo del watchdog periódico (segundos; 0 = deshabilitado)
+        self._watchdog_interval_seconds: float = 30.0
+        # Límite de mensajes que revisa el watchdog por canal
+        self._watchdog_scan_limit: int = 5
+        # Dedupe local de mensajes (chat_id:message_id) para watchdog + eventos.
+        self._processed_ids_max = 5000
+        self._processed_ids_set: set[str] = set()
+        self._processed_ids_order: deque[str] = deque()
 
     # ------------------------------------------------------------------
     # API pública principal
@@ -189,6 +215,10 @@ class TelegramSignalReader:
                 "Revisa TELEGRAM_SOURCE_CHATS (@user, link, id o telefono en contactos)."
             )
 
+        # Guardar para el watchdog
+        self._resolved_chats_cache = list(resolved_chats)
+        self._on_message_cache = on_message
+
         # Registrar handlers una sola vez
         if not self._handlers_registered:
             self._register_handler(on_message, resolved_chats, shutdown_event)
@@ -198,6 +228,11 @@ class TelegramSignalReader:
         keep_alive_task = asyncio.create_task(
             self._keep_alive(shutdown_event),
             name="telegram-keep-alive",
+        )
+        # Lanzar watchdog periódico
+        watchdog_task = asyncio.create_task(
+            self._watchdog_loop(shutdown_event),
+            name="telegram-watchdog",
         )
 
         current_retry = max(3, retry_seconds)
@@ -295,7 +330,8 @@ class TelegramSignalReader:
                     logging.warning("Telegram: fallo al reconectar (%s), reintentando...", exc)
         finally:
             keep_alive_task.cancel()
-            await asyncio.gather(keep_alive_task, return_exceptions=True)
+            watchdog_task.cancel()
+            await asyncio.gather(keep_alive_task, watchdog_task, return_exceptions=True)
             if self._dispatch_tasks:
                 for task in list(self._dispatch_tasks):
                     task.cancel()
@@ -346,6 +382,18 @@ class TelegramSignalReader:
     # Internals
     # ------------------------------------------------------------------
 
+    def _mark_message_processed(self, chat_id: int, message_id: int) -> bool:
+        """Registra un mensaje como procesado. Retorna False si ya existía."""
+        key = f"{chat_id}:{message_id}"
+        if key in self._processed_ids_set:
+            return False
+        self._processed_ids_set.add(key)
+        self._processed_ids_order.append(key)
+        while len(self._processed_ids_order) > self._processed_ids_max:
+            oldest = self._processed_ids_order.popleft()
+            self._processed_ids_set.discard(oldest)
+        return True
+
     def _register_handler(
         self,
         on_message: MessageHandler,
@@ -370,6 +418,14 @@ class TelegramSignalReader:
                 len(text),
                 ingress_lag,
             )
+            logging.info(
+                "DEBUG: Mensaje recibido en crudo: %s... ID: %s",
+                text[:20],
+                event.id,
+            )
+            if not self._mark_message_processed(chat_id, event.id):
+                logging.debug("Telegram: msg duplicado ignorado chat_id=%s msg_id=%s", chat_id, event.id)
+                return
             envelope = TelegramInboundMessage(
                 chat_id=chat_id,
                 message_id=event.id,
@@ -391,6 +447,93 @@ class TelegramSignalReader:
                 )
 
         logging.info("Telegram: handler de mensajes registrado")
+
+    async def _watchdog_scan(self) -> None:
+        """Escanea los últimos N mensajes de cada canal para recuperar señales perdidas.
+        Usa el mismo pipeline que el backfill: el deduplicador del StateManager filtra duplicados.
+        """
+        if not self._resolved_chats_cache or self._on_message_cache is None:
+            return
+        if not self._client.is_connected():
+            return
+
+        total = 0
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=self._watchdog_interval_seconds * 2)
+        for entity in self._resolved_chats_cache:
+            try:
+                messages: list[TelegramInboundMessage] = []
+                fetched = await self._client.get_messages(entity, limit=self._watchdog_scan_limit)
+                if fetched is None:
+                    continue
+
+                if isinstance(fetched, list):
+                    fetched_messages = fetched
+                else:
+                    fetched_messages = [fetched]
+
+                for msg in fetched_messages:
+                    if msg is None:
+                        continue
+                    if not msg.date or msg.date < cutoff:
+                        break
+                    raw_text = cast(str | None, getattr(msg, "raw_text", None) or getattr(msg, "message", None))
+                    text = (raw_text or "").strip()
+                    if not text:
+                        continue
+                    chat_id = getattr(entity, "id", 0)
+                    if not self._mark_message_processed(chat_id, msg.id):
+                        continue
+                    messages.append(TelegramInboundMessage(
+                        chat_id=chat_id,
+                        message_id=msg.id,
+                        text=text,
+                        message_date_utc=msg.date.astimezone(timezone.utc),
+                        received_at_utc=datetime.now(timezone.utc),
+                        source_name=self._id_to_name.get(chat_id, ""),
+                    ))
+                for envelope in reversed(messages):
+                    self._schedule_dispatch(self._on_message_cache, envelope)
+                    total += 1
+            except Exception as exc:
+                logging.debug("Watchdog: error escaneando canal (%s)", exc)
+
+        if total:
+            logging.info("Watchdog: %d mensajes re-evaluados (deduplicador filtrará duplicados)", total)
+
+    async def _watchdog_loop(self, shutdown_event: asyncio.Event) -> None:
+        """Tarea de fondo: escaneo forzado cada _watchdog_interval_seconds."""
+        while not shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    shutdown_event.wait(),
+                    timeout=self._watchdog_interval_seconds,
+                )
+                break  # shutdown
+            except asyncio.TimeoutError:
+                pass
+
+            if shutdown_event.is_set():
+                break
+            try:
+                logging.debug("Watchdog: escaneo periódico (%ds)", int(self._watchdog_interval_seconds))
+                await self._watchdog_scan()
+            except Exception as exc:
+                logging.warning("Watchdog: error en ciclo periódico (%s)", exc)
+
+    def trigger_watchdog_scan(self) -> None:
+        """Dispara un escaneo inmediato en background.
+        Llamar desde engine.py tras registrar WIN/LOSS con un delay de 5s.
+        """
+        if self._on_message_cache is None:
+            return
+        asyncio.create_task(
+            self._delayed_watchdog_scan(delay=5.0),
+            name="telegram-watchdog-post-trade",
+        )
+
+    async def _delayed_watchdog_scan(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        await self._watchdog_scan()
 
     async def _keep_alive(self, shutdown_event: asyncio.Event) -> None:
         """Ping periódico para detectar desconexiones silenciosas (ej: cambio de IP por VPN)."""
@@ -455,6 +598,8 @@ class TelegramSignalReader:
                 )
 
             for envelope in reversed(messages):
+                if not self._mark_message_processed(envelope.chat_id, envelope.message_id):
+                    continue
                 self._schedule_dispatch(on_message, envelope)
                 recovered += 1
 

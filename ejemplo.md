@@ -64520,3 +64520,18 @@ Usa martingala si es necesario 👇
 
 📊 Haz clic aquí para abrir el bróker
 ➡️ ¿No sabes cómo operar? Haz clic aquí
+[08/05/2026 14:05:16] SMART SIGNALS: VICTORIA EN 2ª MARTINGALA ✅🤑
+
+[08/05/2026 14:07:21] SMART SIGNALS: 💵 CAD/CHF OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 14:10
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 14:15
+2️⃣ MARTINGALA A LAS 14:20
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+

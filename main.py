@@ -471,6 +471,8 @@ async def run() -> None:
             restart_after_signal=settings.telegram_restart_after_signal,
         )
 
+        engine._watchdog_trigger = reader.trigger_watchdog_scan
+
         _blackbox.record("reader_start_begin", component="telegram_reader")
         try:
             await reader.run(processor.enqueue_message, shutdown_event)
