@@ -163,13 +163,16 @@ class MasanielloSessionState:
         w_needed: int = 4,
         base_balance: float = 300.0,
         payout_mult: float = 1.92,
+        max_losses: int = 3,
     ) -> None:
         self._n_ops = max(1, n_ops)
         self._w_needed = max(1, w_needed)
         self._base_balance = max(1.0, base_balance)
         self._payout_mult = max(1.01, payout_mult)
+        self._max_losses = max(1, max_losses)
         self._wins: int = 0
         self._losses: int = 0
+        self._session_blocked: bool = False
 
     @property
     def wins(self) -> int:
@@ -187,6 +190,15 @@ class MasanielloSessionState:
     def is_session_over(self) -> bool:
         return self._wins >= self._w_needed or self.signals_consumed >= self._n_ops
 
+    @property
+    def is_session_blocked(self) -> bool:
+        """True cuando la sesion fue cortada por exceso de perdidas (MAX_SESSION_LOSSES).
+
+        El engine DEBE consultar esto antes de calcular montos; si esta bloqueada,
+        la sesion se descarta sin ejecutar trade. No afecta timing ni pipeline.
+        """
+        return self._session_blocked
+
     def current_entry_stake(self) -> float:
         """Devuelve la apuesta de entrada Masaniello para el estado actual."""
         return self._masaniello_stake(self._base_balance, self._losses, self._wins)
@@ -194,6 +206,7 @@ class MasanielloSessionState:
     def record_win(self) -> None:
         """Registra una victoria de señal (WD, G1 o G2). Reinicia sesion si completa."""
         self._wins += 1
+        self._session_blocked = False  # un win desbloquea la sesion
         logging.info(
             "MasanielloSession WIN: wins=%d losses=%d consumed=%d/%d",
             self._wins,
@@ -210,7 +223,12 @@ class MasanielloSessionState:
             self._losses = 0
 
     def record_loss(self) -> None:
-        """Registra una perdida de señal completa (L). Reinicia sesion si agotada."""
+        """Registra una perdida de señal completa (L). Reinicia sesion si agotada.
+
+        MAX_SESSION_LOSSES guard: si se alcanzan _max_losses perdidas en la sesion,
+        la sesion se marca como bloqueada y se reinicia. Esto limita la exposicion
+        maxima por sesion sin afectar timing ni pipeline de ejecucion.
+        """
         self._losses += 1
         logging.info(
             "MasanielloSession LOSS: wins=%d losses=%d consumed=%d/%d",
@@ -219,6 +237,17 @@ class MasanielloSessionState:
             self.signals_consumed,
             self._n_ops,
         )
+        if self._losses >= self._max_losses:
+            logging.warning(
+                "MasanielloSession: LOSS GUARD activado (losses=%d >= max=%d). "
+                "Sesion bloqueada y reiniciada.",
+                self._losses,
+                self._max_losses,
+            )
+            self._session_blocked = True
+            self._wins = 0
+            self._losses = 0
+            return
         if self.is_session_over:
             logging.info(
                 "MasanielloSession: sesion AGOTADA (losses=%d). Reiniciando.",

@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from src.config.settings import AppSettings
 from src.core.engine import SignalEngine
 from src.core.models import TradingSignal
+from src.core.masaniello_manager import MasanielloManager
 from src.core.pipeline import MessageQueue, SignalProcessor, StateManager, GlobalGaleState, MasanielloSessionState, RecoveryProfile
 from src.core.equity_bands import EquityBandManager
 from src.core.daily_profit_tracker import DailyProfitTracker
@@ -349,6 +350,14 @@ async def run() -> None:
             w_needed=settings.masaniello_w_needed,
             base_balance=_initial_masaniello_base,
             payout_mult=settings.calc_payout_percent / 100.0 + 1.0,
+            max_losses=settings.masaniello_max_session_losses,
+        )
+        # Caja negra de stake: no toca scheduling/async; solo entrega el siguiente monto.
+        masaniello_manager = MasanielloManager(
+            session_base_capital=10.0,
+            ops_total=6,
+            wins_needed=3,
+            payout=settings.calc_payout_percent / 100.0,
         )
         # RecoveryProfile: g1/g2 desde .env; si vacios, calculo automatico desde payout.
         # Congelado al inicio — NO se recalcula en tiempo real.
@@ -411,6 +420,7 @@ async def run() -> None:
             signal_late_tolerance_seconds=settings.signal_late_tolerance_seconds,
             global_gale_state=global_gale_state,
             masaniello_session=masaniello_session,
+            masaniello_manager=masaniello_manager,
             recovery_profile=recovery_profile,
             calc_base_balance=_initial_calc_base,
             event_recorder=_blackbox.record,

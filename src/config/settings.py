@@ -58,6 +58,7 @@ class AppSettings:
     masaniello_n_ops: int
     masaniello_w_needed: int
     masaniello_base_balance: float
+    masaniello_max_session_losses: int   # max perdidas antes de cortar sesion
     # ── Sizing global ──────────────────────────────────────────────────────
     max_trade_pct: float          # cap por operación: ej 0.10 = 10% de base
     max_total_exposure_pct: float # cap exposición total — placeholder RiskEngine
@@ -180,6 +181,7 @@ class AppSettings:
             masaniello_n_ops=int(os.getenv("APP_MASANIELLO_N_OPS", "12")),
             masaniello_w_needed=int(os.getenv("APP_MASANIELLO_W_NEEDED", "4")),
             masaniello_base_balance=float(os.getenv("APP_MASANIELLO_BASE_BALANCE", "300")),
+            masaniello_max_session_losses=int(os.getenv("APP_MASANIELLO_MAX_SESSION_LOSSES", "3")),
             max_trade_pct=float(os.getenv("APP_MAX_TRADE_PCT", "0.10")),
             max_total_exposure_pct=float(os.getenv("APP_MAX_TOTAL_EXPOSURE_PCT", "0.25")),
             calc_base_balance=float(os.getenv("APP_CALC_BASE_BALANCE", "300")),

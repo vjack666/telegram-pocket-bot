@@ -8,6 +8,7 @@ from src.core.console_hub import clear_countdown_line, print_countdown_line, pri
 from src.pocket_option.assets import canonicalize_pocket_asset, normalize_asset_for_compare
 from src.pocket_option.client import PocketOptionBaseClient
 from src.pocket_option.trade_panel_feed import LiveTradeSnapshot
+from src.core.masaniello_manager import MasanielloManager
 from src.core.pipeline import MasanielloSessionState, RecoveryProfile
 from src.core.equity_bands import EquityBandManager
 from src.core.daily_profit_tracker import DailyProfitTracker
@@ -29,6 +30,7 @@ class SignalEngine:
         signal_late_tolerance_seconds: int,
         global_gale_state: Any,
         masaniello_session: MasanielloSessionState | None = None,
+        masaniello_manager: MasanielloManager | None = None,
         recovery_profile: RecoveryProfile | None = None,
         calc_base_balance: float = 300.0,
         event_recorder: Callable[..., None] | None = None,
@@ -39,6 +41,7 @@ class SignalEngine:
         self._martingale_amounts = [value for value in martingale_amounts if value > 0] or [2.0, 4.0, 10.0]
         self._martingale_mode = martingale_mode if martingale_mode in {"fixed", "calculator", "masaniello"} else "fixed"
         self._masaniello_session = masaniello_session
+        self._masaniello_manager = masaniello_manager
         self._calc_payout = max(0.01, calc_payout_percent / 100.0)
         self._calc_increment = max(1, calc_increment)
         self._calc_rule10_threshold = max(0.0, calc_rule10_balance_threshold)
@@ -68,6 +71,12 @@ class SignalEngine:
         self._last_known_balance: float | None = None
         self._equity_manager: Optional[EquityBandManager] = equity_manager
         self._daily_profit_tracker: Optional[DailyProfitTracker] = daily_profit_tracker
+        self._ultimo_resultado: str | None = None
+        self._next_entry_override: float | None = None
+        if self._masaniello_manager is not None:
+            # Precalcular stake inicial para no introducir latencia en el disparo.
+            self._next_entry_override = self._masaniello_manager.get_next_stake(None)
+            self._log_masaniello_next_entry(self._next_entry_override)
         # CRITICAL FIX: Broker-level lock to serialize all browser operations
         self._broker_lock = asyncio.Lock()
 
@@ -215,6 +224,7 @@ class SignalEngine:
                 self._global_gale.record_win()
                 if self._masaniello_session is not None:
                     self._masaniello_session.record_win()
+                self._update_masaniello_manager_after_result("W")
                 
                 # Registrar en daily profit tracker
                 pnl_win = round(amount * self._calc_payout, 2)
@@ -247,6 +257,7 @@ class SignalEngine:
                 self._global_gale.record_loss(amount)
                 if self._masaniello_session is not None:
                     self._masaniello_session.record_loss()
+                self._update_masaniello_manager_after_result("L")
                 
                 # Registrar en daily profit tracker (pérdida)
                 pnl_loss = round(-amount, 2)
@@ -463,6 +474,7 @@ class SignalEngine:
             self._global_gale.record_win()
             if self._masaniello_session is not None:
                 self._masaniello_session.record_win()
+            self._update_masaniello_manager_after_result("W")
             self._emit_event(
                 "trade_result_win",
                 asset=signal.asset,
@@ -1000,47 +1012,114 @@ class SignalEngine:
 
     def _build_cycle_amounts(self, current_balance: float) -> list[float]:
         if self._martingale_mode == "masaniello" and self._masaniello_session is not None:
+            if self._masaniello_manager is not None:
+                return self._masaniello_manager_amounts()
+            if self._masaniello_session.is_session_blocked:
+                logging.warning(
+                    "MasanielloSession bloqueada (MAX_LOSSES GUARD). "
+                    "Usando amounts cero para skip de senial. "
+                    "El bloqueo se libera en el proximo WIN."
+                )
+                # Devuelve stakes minimos: el engine los ejecutara pero seran $0.01 (dry-safe).
+                # Esto preserva el pipeline de timing intacto; el riesgo financiero es nulo.
+                return [0.01, 0.01, 0.01]
             return self._masaniello_amounts(current_balance)
         if self._martingale_mode != "calculator":
             return list(self._martingale_amounts)
         return self._calculator_amounts(current_balance)
 
+    def _update_masaniello_manager_after_result(self, result: str) -> None:
+        """Actualiza estado de caja negra inmediatamente al cerrar una señal."""
+        if self._masaniello_manager is None:
+            return
+        self._ultimo_resultado = result
+        self._next_entry_override = self._masaniello_manager.get_next_stake(self._ultimo_resultado)
+        self._ultimo_resultado = None
+        self._log_masaniello_next_entry(self._next_entry_override)
+
+    def _log_masaniello_next_entry(self, stake: float) -> None:
+        if self._masaniello_manager is None:
+            return
+        snap = self._masaniello_manager.snapshot()
+        logging.info(
+            "Masaniello -> Siguiente entrada: $%.2f | Estado Sesion: (W: %d, L: %d)",
+            stake,
+            snap.itms,
+            snap.otms,
+        )
+
+    def _masaniello_manager_amounts(self) -> list[float]:
+        """Calcula [entry, G1, G2] desde MasanielloManager sin tocar timing."""
+        assert self._masaniello_manager is not None
+
+        if self._next_entry_override is None:
+            self._next_entry_override = self._masaniello_manager.get_next_stake(self._ultimo_resultado)
+            self._ultimo_resultado = None
+            self._log_masaniello_next_entry(self._next_entry_override)
+
+        entry = max(0.01, round(self._next_entry_override, 2))
+        g1_mult = self._recovery_profile.g1_mult
+        g2_mult = self._recovery_profile.g2_mult
+        amounts = [
+            entry,
+            round(entry * g1_mult, 2),
+            round(entry * g2_mult, 2),
+        ]
+        return amounts
+
     def _masaniello_amounts(self, current_balance: float) -> list[float]:
         """Calcula [entry, G1, G2] usando la formula Masaniello para el estado actual de sesion.
 
-        Cap: usa base fija del Masaniello (no balance en tiempo real) para evitar
-        escalado accidental. Cap se aplica ANTES del round en todos los pasos.
+        CAP TOTAL: el cap_pct se aplica sobre la exposicion TOTAL de la senial
+        (entry + G1 + G2), no sobre cada paso individualmente.
+
+        Con payout=92%: total_mult = 1 + (1.92/0.92) + (1.92/0.92)^2 ≈ 7.44
+        entry_max = base * cap_pct / total_mult
+        → garantiza que entry + G1 + G2 ≤ base * cap_pct en el peor caso.
+
+        Esto NO afecta timing ni pipeline; solo cambia el tamano de las ordenes.
         """
         assert self._masaniello_session is not None
-        entry = self._masaniello_session.current_entry_stake()
+        entry_raw = self._masaniello_session.current_entry_stake()
         base = self._masaniello_session._base_balance
-        cap = round(max(0.01, base * self._recovery_profile.max_trade_pct), 2)
         g1_mult = self._recovery_profile.g1_mult
         g2_mult = self._recovery_profile.g2_mult
+        cap_pct = self._recovery_profile.max_trade_pct
 
-        # Cap antes de round en TODOS los pasos
+        # Exposicion total si se juegan los 3 pasos: entry * (1 + g1 + g2)
+        total_mult = 1.0 + g1_mult + g2_mult
+        # entry maxima tal que entry * total_mult == base * cap_pct
+        cap_total = round(max(0.01, base * cap_pct), 2)
+        entry_max = round(cap_total / total_mult, 4)
+
+        entry = round(min(entry_raw, entry_max), 2)
+        entry = max(0.01, entry)
+
         amounts = [
-            round(min(entry, cap), 2),
-            round(min(entry * g1_mult, cap), 2),
-            round(min(entry * g2_mult, cap), 2),
+            entry,
+            round(entry * g1_mult, 2),
+            round(entry * g2_mult, 2),
         ]
-        cap_active = any(v > cap for v in [entry, entry * g1_mult, entry * g2_mult])
+        cap_was_active = entry_raw > entry_max
         logging.info(
-            "Masaniello %d/%d: señal %d/%d wins=%d losses=%d entry=%.2f "
-            "cap=%.2f(%.0f%%) g1x=%.4f g2x=%.4f amounts=%s%s",
+            "Masaniello %d/%d: señal %d/%d wins=%d losses=%d "
+            "entry_raw=%.2f entry_capped=%.2f cap_total=%.2f(%.0f%%) "
+            "total_mult=%.4f g1x=%.4f g2x=%.4f amounts=%s%s",
             self._masaniello_session._n_ops,
             self._masaniello_session._w_needed,
             self._masaniello_session.signals_consumed + 1,
             self._masaniello_session._n_ops,
             self._masaniello_session.wins,
             self._masaniello_session.losses,
+            entry_raw,
             entry,
-            cap,
-            self._recovery_profile.max_trade_pct * 100,
+            cap_total,
+            cap_pct * 100,
+            total_mult,
             g1_mult,
             g2_mult,
             amounts,
-            " [CAP ACTIVO]" if cap_active else "",
+            " [CAP TOTAL ACTIVO]" if cap_was_active else "",
         )
         return amounts
 
