@@ -354,9 +354,10 @@ async def run() -> None:
         )
         # Caja negra de stake: no toca scheduling/async; solo entrega el siguiente monto.
         masaniello_manager = MasanielloManager(
-            session_base_capital=10.0,
-            ops_total=6,
-            wins_needed=3,
+            session_base_capital=settings.masaniello_manager_session_base,
+            ops_total=settings.masaniello_manager_ops_total,
+            wins_needed=settings.masaniello_manager_wins_needed,
+            max_gale_multiplier=settings.masaniello_manager_max_gale_mult,
             payout=settings.calc_payout_percent / 100.0,
         )
         # RecoveryProfile: g1/g2 desde .env; si vacios, calculo automatico desde payout.
@@ -495,11 +496,27 @@ async def run() -> None:
                     reason="transient_cancelled_error",
                 )
         except Exception as exc:
-            _set_shutdown_reason(
-                "internal_error",
-                "telegram_reader",
-                last_exception=f"{type(exc).__name__}: {exc}",
+            exc_message = str(exc)
+            is_telegram_source_config_error = (
+                isinstance(exc, RuntimeError)
+                and "No se pudo resolver ningun chat origen de Telegram" in exc_message
             )
+            if is_telegram_source_config_error:
+                _set_shutdown_reason(
+                    "config_error",
+                    "telegram_reader",
+                    last_exception=f"{type(exc).__name__}: {exc}",
+                )
+                logging.error(
+                    "Configuracion Telegram invalida: TELEGRAM_SOURCE_CHATS contiene un chat no resoluble. "
+                    "Corrige @usuario/link/id y reinicia."
+                )
+            else:
+                _set_shutdown_reason(
+                    "internal_error",
+                    "telegram_reader",
+                    last_exception=f"{type(exc).__name__}: {exc}",
+                )
             logging.exception("reader.run() terminó con error fatal: %s", exc)
             _blackbox.record(
                 "reader_exception",
@@ -1275,8 +1292,12 @@ if __name__ == "__main__":
             _blackbox.record("top_level_unhandled_exception", component="main", error_message=str(exc))
             _log_exception_origin("Error inesperado en main", exc)
         else:
-            external_interrupt_recoveries = 0
-            restart_attempts = 0
+            # asyncio.run(run()) retorno sin excepcion top-level.
+            # Si run() termino por internal_error/cancelled_error, NO resetear contador
+            # para que el limite MAX_MAIN_RESTARTS funcione correctamente.
+            if _shutdown_diag.reason not in {"internal_error", "cancelled_error"}:
+                external_interrupt_recoveries = 0
+                restart_attempts = 0
             if _shutdown_diag.reason == "running":
                 _set_shutdown_reason("normal_exit", "main")
         finally:
@@ -1305,6 +1326,12 @@ if __name__ == "__main__":
                     "Se alcanzo el maximo de reinicios por error (%s).",
                     MAX_MAIN_RESTARTS,
                 )
+
+        if not should_restart and _shutdown_diag.reason == "config_error":
+            logging.error(
+                "Error de configuracion detectado (%s). Reinicio automatico deshabilitado.",
+                _shutdown_diag.last_exception or "config_error",
+            )
 
         if should_restart:
             continue

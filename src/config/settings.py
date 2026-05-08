@@ -80,6 +80,11 @@ class AppSettings:
     daily_profit_target: float                  # meta diaria en dinero ($60)
     daily_profit_defensive_mode: bool           # cambiar a defensive tras meta
     daily_profit_state_path: str                # ruta del json de estado diario
+    # ── MasanielloManager (caja negra de stake) ────────────────────────────
+    masaniello_manager_session_base: float      # capital por sesión (caja)
+    masaniello_manager_ops_total: int           # operaciones por sesión
+    masaniello_manager_wins_needed: int         # ITM necesarios para ganar sesión
+    masaniello_manager_max_gale_mult: int       # techo Macro-Gale (ej. 16 = x1..x16)
 
     @staticmethod
     def load() -> "AppSettings":
@@ -226,6 +231,18 @@ class AppSettings:
                 "APP_DAILY_PROFIT_STATE_PATH",
                 "runtime/daily_profit_state.json",
             ).strip(),
+            masaniello_manager_session_base=float(
+                os.getenv("APP_MASANIELLO_MANAGER_SESSION_BASE", "10.0")
+            ),
+            masaniello_manager_ops_total=int(
+                os.getenv("APP_MASANIELLO_MANAGER_OPS_TOTAL", "6")
+            ),
+            masaniello_manager_wins_needed=int(
+                os.getenv("APP_MASANIELLO_MANAGER_WINS_NEEDED", "3")
+            ),
+            masaniello_manager_max_gale_mult=int(
+                os.getenv("APP_MASANIELLO_MANAGER_MAX_GALE_MULT", "16")
+            ),
         )
 
 
