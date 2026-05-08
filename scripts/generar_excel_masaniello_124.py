@@ -203,22 +203,37 @@ def simulate(outcomes: list[Outcome], n: int, w: int) -> tuple[list[SessionRow],
             if wins_needed <= 0 or wins_needed > ops_left:
                 break
 
-            cap   = round(balance * CAP_PCT, 2)
+            # Cap aplicado sobre EXPOSICIÓN TOTAL (entry + G1 + G2)
+            # para que el riesgo máximo por señal sea ≤ CAP_PCT del capital.
+            # Multiplicador total: 1 + pm/(pm-1) + (pm/(pm-1))^2
+            pm = PAYOUT_MULT
+            _r  = pm / (pm - 1)                          # ratio de gale ≈ 2.087
+            _total_mult = 1 + _r + _r ** 2               # ≈ 7.442
+            cap_total = round(balance * CAP_PCT, 2)       # 10% de la cuenta
+            entry_max = round(cap_total / _total_mult, 2) # entry que hace total = cap_total
+
             entry = masaniello_stake(BASE_BALANCE, losses, wins, n, w, PAYOUT_MULT)
-            entry = min(entry, cap)
+            entry = min(entry, entry_max)                 # cap real por señal
+
+            # Gales proporcionales al entry real (no capeados individualmente)
+            g1_amount = round(entry * _r, 2)
+            g2_amount = round(entry * _r ** 2, 2)
+            total_loss = round(entry + g1_amount + g2_amount, 2)
 
             results.append(outcome.result)
             stakes.append(entry)
 
             if outcome.is_win:
                 wins  += 1
+                # La ganancia neta es siempre entry * (pm-1) gracias a Masaniello
                 gain   = round(entry * (PAYOUT_MULT - 1), 2)
                 pnl   += gain
                 balance = round(balance + gain, 2)
             else:
                 losses += 1
-                pnl    -= entry
-                balance = round(balance - entry, 2)
+                # Pérdida real: se agotaron entry + G1 + G2
+                pnl    -= total_loss
+                balance = round(balance - total_loss, 2)
 
             min_bal = min(min_bal, balance)
             row["min_bal"] = min(row["min_bal"], balance)
@@ -370,27 +385,37 @@ def sheet_resumen(wb, sessions_124, daily_124, stats_124,
     win_sigs_62   = sum(1 for s in sessions_62 for r in s.resultados if r != "L")
     wr_62 = win_sigs_62 / total_sigs_62 * 100 if total_sigs_62 else 0
 
-    stake_ini_124 = masaniello_stake(BASE_BALANCE, 0, 0, N_OPS, W_NEEDED, PAYOUT_MULT)
-    stake_ini_62  = masaniello_stake(BASE_BALANCE, 0, 0, N_OPS_62, W_NEEDED_62, PAYOUT_MULT)
-    stake_max_124 = masaniello_stake(BASE_BALANCE, 3, 0, N_OPS, W_NEEDED, PAYOUT_MULT)
-    stake_max_62  = masaniello_stake(BASE_BALANCE, 3, 0, N_OPS_62, W_NEEDED_62, PAYOUT_MULT)
+    _r = PAYOUT_MULT / (PAYOUT_MULT - 1)
+    _total_mult = 1 + _r + _r ** 2   # ≈ 7.442
+
+    # Entry real: masaniello_stake capeado para que (entry+G1+G2) ≤ 10% de cuenta
+    cap_total_124 = BASE_BALANCE * CAP_PCT
+    entry_max_124 = round(cap_total_124 / _total_mult, 2)
+    stake_ini_124 = min(masaniello_stake(BASE_BALANCE, 0, 0, N_OPS, W_NEEDED, PAYOUT_MULT), entry_max_124)
+    stake_max_124 = min(masaniello_stake(BASE_BALANCE, 3, 0, N_OPS, W_NEEDED, PAYOUT_MULT), entry_max_124)
+
+    cap_total_62  = BASE_BALANCE * CAP_PCT
+    entry_max_62  = round(cap_total_62 / _total_mult, 2)
+    stake_ini_62  = min(masaniello_stake(BASE_BALANCE, 0, 0, N_OPS_62, W_NEEDED_62, PAYOUT_MULT), entry_max_62)
+    stake_max_62  = min(masaniello_stake(BASE_BALANCE, 3, 0, N_OPS_62, W_NEEDED_62, PAYOUT_MULT), entry_max_62)
 
     rows_data = [
-        ("Capital inicial",           money(CAPITAL),               money(CAPITAL),               "—"),
-        ("Balance final",             money(stats_124["final"]),     money(stats_62["final"]),      money(stats_124["final"] - stats_62["final"])),
-        ("Balance máximo alcanzado",  money(stats_124["peak"]),      money(stats_62["peak"]),       money(stats_124["peak"] - stats_62["peak"])),
-        ("Balance mínimo observado",  money(stats_124["min"]),       money(stats_62["min"]),        money(stats_124["min"] - stats_62["min"])),
-        ("DrawDown máximo ($)",       money(stats_124["max_dd"]),    money(stats_62["max_dd"]),     money(stats_124["max_dd"] - stats_62["max_dd"])),
-        ("DrawDown máximo (%)",       pct(stats_124["max_dd"]/CAPITAL*100), pct(stats_62["max_dd"]/CAPITAL*100), "—"),
-        ("Días analizados",           str(dias_124),                 str(dias_62),                  "—"),
-        ("Días con meta $60",         f"{meta_124}/{dias_124}",      f"{meta_62}/{dias_62}",        f"{meta_124 - meta_62:+d}"),
-        ("Sesiones totales operadas", str(len(sessions_124)),        str(len(sessions_62)),         f"{len(sessions_124) - len(sessions_62):+d}"),
-        ("Sesiones ganadas",          str(wd_124),                   str(wd_62),                    f"{wd_124 - wd_62:+d}"),
-        ("Señales consumidas",        str(total_sigs_124),           str(total_sigs_62),            f"{total_sigs_124 - total_sigs_62:+d}"),
-        ("Win Rate real señales",     pct(wr_124),                   pct(wr_62),                    "—"),
-        ("Stake entrada 0L/0W",       money(stake_ini_124),          money(stake_ini_62),           money(stake_ini_124 - stake_ini_62)),
-        ("Stake máximo 3L/0W",        money(stake_max_124),          money(stake_max_62),           money(stake_max_124 - stake_max_62)),
-        ("Cap 10% sobre $300",        money(BASE_BALANCE * CAP_PCT), money(BASE_BALANCE * CAP_PCT), "—"),
+        ("Capital inicial",                   money(CAPITAL),               money(CAPITAL),               "—"),
+        ("Balance final",                     money(stats_124["final"]),     money(stats_62["final"]),      money(stats_124["final"] - stats_62["final"])),
+        ("Balance máximo alcanzado",          money(stats_124["peak"]),      money(stats_62["peak"]),       money(stats_124["peak"] - stats_62["peak"])),
+        ("Balance mínimo observado",          money(stats_124["min"]),       money(stats_62["min"]),        money(stats_124["min"] - stats_62["min"])),
+        ("DrawDown máximo ($)",               money(stats_124["max_dd"]),    money(stats_62["max_dd"]),     money(stats_124["max_dd"] - stats_62["max_dd"])),
+        ("DrawDown máximo (%)",               pct(stats_124["max_dd"]/CAPITAL*100), pct(stats_62["max_dd"]/CAPITAL*100), "—"),
+        ("Días analizados",                   str(dias_124),                 str(dias_62),                  "—"),
+        ("Días con meta $60",                 f"{meta_124}/{dias_124}",      f"{meta_62}/{dias_62}",        f"{meta_124 - meta_62:+d}"),
+        ("Sesiones totales operadas",         str(len(sessions_124)),        str(len(sessions_62)),         f"{len(sessions_124) - len(sessions_62):+d}"),
+        ("Sesiones ganadas",                  str(wd_124),                   str(wd_62),                    f"{wd_124 - wd_62:+d}"),
+        ("Señales consumidas",                str(total_sigs_124),           str(total_sigs_62),            f"{total_sigs_124 - total_sigs_62:+d}"),
+        ("Win Rate real señales",             pct(wr_124),                   pct(wr_62),                    "—"),
+        ("Entry 0L/0W (cap total aplicado)",  money(stake_ini_124),          money(stake_ini_62),           money(stake_ini_124 - stake_ini_62)),
+        ("Entry max 3L/0W (cap total aplic.)",money(stake_max_124),          money(stake_max_62),           money(stake_max_124 - stake_max_62)),
+        ("Exposición TOTAL máx (entry+G1+G2)",money(entry_max_124 * _total_mult), money(entry_max_62 * _total_mult), "—"),
+        ("Cap 10% de la cuenta ($300)",       money(BASE_BALANCE * CAP_PCT), money(BASE_BALANCE * CAP_PCT), "—"),
     ]
 
     for r, (label, v124, v62, diff) in enumerate(rows_data, 5):
@@ -424,8 +449,9 @@ def sheet_resumen(wb, sessions_124, daily_124, stats_124,
     ws.row_dimensions[last].height = 10
     ws.merge_cells(f"A{last+1}:D{last+1}")
     note = ws[f"A{last+1}"]
-    note.value = ("★  Stakes calculados sobre banca base fija $300 (no sobre balance real) "
-                  "para evitar escalar riesgo.  Cap 10% activo por señal.")
+    note.value = ("★  El cap 10% aplica sobre la EXPOSICIÓN TOTAL por señal (entry + G1 + G2 ≤ $30). "
+                  "Entry máximo = $30 ÷ 7.44 ≈ $4.03 para que incluso si fallan los 3 intentos, "
+                  "no se pierde más del 10% de la cuenta en una sola señal.")
     note.fill  = fill(AMARILLO)
     note.font  = Font(italic=True, size=9)
     note.alignment = Alignment(wrap_text=True)
