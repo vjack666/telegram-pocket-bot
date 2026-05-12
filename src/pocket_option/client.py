@@ -44,9 +44,12 @@ class PocketOptionBaseClient(ABC):
     async def get_live_trade_snapshot(
         self,
         asset: str,
-        side: str,
+        side: str | None,
         timeout: float = 1.5,
     ) -> LiveTradeSnapshot | None:
+        raise NotImplementedError
+
+    async def set_amount(self, amount: float, max_retries: int = 3) -> None:
         raise NotImplementedError
 
     async def prepare_order_for_execution(
@@ -63,6 +66,9 @@ class PocketOptionBaseClient(ABC):
 
     async def get_selected_asset(self) -> str:
         return ""
+
+    async def get_configured_expiry_seconds(self) -> int | None:
+        return None
 
 
 class PocketOptionDemoClient(PocketOptionBaseClient):
@@ -108,6 +114,7 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
         self._is_closing = False
         self._active_playwright_ops = 0
         self._last_selected_asset = ""
+        self._last_logged_balance: float | None = None  # suprimir spam de log cuando saldo no cambia
         self._candle_feed = CandleFeed()
         self._trade_panel_feed = TradePanelFeed()
 
@@ -152,6 +159,11 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
                         last_profile_exc = exc
                         await self._playwright.stop()
                         self._playwright = None
+
+                        logging.warning(
+                            "[Browser] Error al abrir perfil (intento %s): %s",
+                            attempt, str(exc)[:300],
+                        )
 
                         if _is_profile_in_use_error(exc) and attempt < max_profile_open_retries:
                             # Si el perfil principal parece bloqueado, migrar a un perfil alterno limpio.
@@ -323,7 +335,7 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
     async def get_live_trade_snapshot(
         self,
         asset: str,
-        side: str,
+        side: str | None,
         timeout: float = 1.5,
     ) -> LiveTradeSnapshot | None:
         await self.connect()
@@ -392,6 +404,12 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
 
         await self._run_with_browser_ui_lock("place_order", _do_place)
         logging.info("Orden enviada a Pocket Option: %s", payload)
+
+    async def set_amount(self, amount: float, max_retries: int = 3) -> None:
+        """Escribe el monto en el campo amount del broker (sin cambiar asset ni expiración)."""
+        if not self._execute_orders:
+            return
+        await self._set_amount(amount, max_retries=max_retries)
 
     async def prepare_order_for_execution(
         self,
@@ -479,6 +497,19 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
         return await self._run_with_browser_ui_lock(
             "get_selected_asset",
             _do_get_selected_asset,
+        )
+
+    async def get_configured_expiry_seconds(self) -> int | None:
+        if self._page is None:
+            return None
+
+        async def _do_get_expiry_seconds() -> int | None:
+            label = await self._read_expiry_label()
+            return _parse_expiry_label_seconds(label)
+
+        return await self._run_with_browser_ui_lock(
+            "get_configured_expiry_seconds",
+            _do_get_expiry_seconds,
         )
 
     async def _run_with_browser_ui_lock(
@@ -879,13 +910,16 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
 
         if candidates:
             chosen = max(candidates, key=lambda x: (x[0], x[1]))
-            logging.info(
-                "Saldo elegido=%s (score=%s, selector=%s, fuente=%s)",
-                chosen[1],
-                chosen[0],
-                chosen[3],
-                chosen[2][:120],
-            )
+            if chosen[1] != self._last_logged_balance:
+                _fuente_limpia = " ".join(chosen[2].split())[:120]
+                logging.debug(
+                    "Saldo elegido=%s (score=%s, selector=%s, fuente=%s)",
+                    chosen[1],
+                    chosen[0],
+                    chosen[3],
+                    _fuente_limpia,
+                )
+                self._last_logged_balance = chosen[1]
             return chosen[1]
 
         raise RuntimeError(
@@ -907,8 +941,13 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
         for attempt in range(1, attempts + 1):
             try:
                 await self._set_amount_once(amount_text)
+                # Dejar la gráfica libre tras escribir el monto (cerrar foco/cualquier popover).
+                try:
+                    await self._page.keyboard.press("Escape")
+                except Exception:
+                    pass
                 logging.info(
-                    "✓ Monto inyectado correctamente: $%.2f (intento %d/%d)",
+                    "✓ Monto inyectado correctamente: $%.2f (intento %d/%d) | Escape enviado",
                     amount,
                     attempt,
                     attempts,
@@ -963,6 +1002,11 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
     async def _set_expiry_minutes_once(self, expiry_minutes: int) -> None:
         if self._page is None:
             raise RuntimeError("Cliente no conectado")
+
+        # Paso 0: garantizar que estamos en modo Countdown (no Expiration/UTC).
+        # Si el label muestra "17:45" (HH:MM sin segundos) en lugar de "M5" o "00:05:00"
+        # el bot no encontrará las opciones y entrará en bucle. Lo resolvemos aquí.
+        await self._ensure_countdown_mode()
 
         # Si ya está en el valor deseado, salir temprano.
         current = await self._read_expiry_label()
@@ -1053,6 +1097,68 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
             except Exception:
                 continue
         return ""
+
+    async def _ensure_countdown_mode(self) -> None:
+        """Garantiza que el panel de expiración esté en modo Countdown (M1, M5...).
+
+        Pocket Option tiene dos modos:
+        - Countdown : muestra 'M5', '00:05:00' → el bot puede seleccionar la opción.
+        - Expiration : muestra 'HH:MM' (hora UTC, ej. '17:45') → las opciones M1/M5
+          no existen y el bot entra en bucle infinito de reintentos.
+
+        Si detectamos formato HH:MM hacemos click en el ícono de reloj/toggle
+        para volver a Countdown antes de intentar configurar la expiración.
+        """
+        if self._page is None:
+            return
+
+        label = await self._read_expiry_label()
+        if not _is_expiration_mode_label(label):
+            return  # Ya estamos en Countdown, nada que hacer.
+
+        logging.info(
+            "[ExpiryMode] Detectado modo Expiration (label='%s'). Cambiando a Countdown...", label
+        )
+
+        # Selectores conocidos del botón toggle Countdown/Expiration en Pocket Option.
+        # El botón suele ser un ícono de reloj (clock) o bandera dentro del bloque de expiración.
+        toggle_selectors = [
+            "#put-call-buttons-chart-1 .block--expiration-inputs .expiration-type-switch",
+            "#put-call-buttons-chart-1 .block--expiration-inputs .duration-type-button",
+            "#put-call-buttons-chart-1 .block--expiration-inputs [class*='type']",
+            ".block--expiration-inputs .expiration-type-switch",
+            ".block--expiration-inputs [class*='type-switch']",
+            ".block--expiration-inputs [class*='toggle']",
+            # Selector más genérico: primer elemento interactivo dentro del bloque
+            "#put-call-buttons-chart-1 .block--expiration-inputs button",
+        ]
+
+        switched = False
+        for selector in toggle_selectors:
+            try:
+                toggle = self._page.locator(selector).first
+                if await toggle.count() == 0 or not await toggle.is_visible():
+                    continue
+                await toggle.click(timeout=2000)
+                await asyncio.sleep(0.4)
+                new_label = await self._read_expiry_label()
+                if not _is_expiration_mode_label(new_label):
+                    logging.info(
+                        "[ExpiryMode] Cambiado a Countdown correctamente (nuevo label='%s').",
+                        new_label,
+                    )
+                    switched = True
+                    break
+            except Exception:
+                continue
+
+        if not switched:
+            logging.warning(
+                "[ExpiryMode] No se pudo cambiar de Expiration a Countdown. "
+                "El bot intentará configurar la expiración de todos modos. "
+                "Si el panel muestra hora UTC, es posible que falle. "
+                "Revisa el selector del botón toggle en el DOM de Pocket Option."
+            )
 
     async def _set_amount_once(self, amount_text: str) -> None:
         """Intenta una sola vez con fallback chain."""
@@ -1340,6 +1446,54 @@ def _expiry_label_matches(label: str, expiry_minutes: int) -> bool:
     if text.endswith(f":{expiry_minutes:02d}"):
         return True
     return False
+
+
+def _is_expiration_mode_label(label: str) -> bool:
+    """Devuelve True si el label indica modo Expiration (hora UTC tipo '17:45').
+
+    Modo Countdown muestra: 'M5', '00:05:00', '00:05'  → False
+    Modo Expiration muestra: '17:45', '08:30'           → True
+    """
+    text = (label or "").strip()
+    if not text:
+        return False
+    # Formato HH:MM sin segundos y sin letra M → modo Expiration
+    import re as _re
+    if _re.match(r"^\d{1,2}:\d{2}$", text) and "M" not in text.upper():
+        return True
+    return False
+
+
+def _parse_expiry_label_seconds(label: str) -> int | None:
+    text = (label or "").strip().upper()
+    if not text:
+        return None
+
+    match_m = re.search(r"\bM\s*(\d{1,3})\b", text)
+    if match_m:
+        minutes = max(1, int(match_m.group(1)))
+        return minutes * 60
+
+    match_hms = re.match(r"^(\d{1,2}):(\d{2}):(\d{2})$", text)
+    if match_hms:
+        hh = int(match_hms.group(1))
+        mm = int(match_hms.group(2))
+        ss = int(match_hms.group(3))
+        # Evitar confundir hora de reloj (modo Expiration) con countdown.
+        # Countdown válido típico: 00:MM:SS (hh debe ser 0).
+        if hh != 0:
+            return None
+        total = hh * 3600 + mm * 60 + ss
+        return total if 1 <= total <= 3600 else None
+
+    match_ms = re.match(r"^(\d{1,2}):(\d{2})$", text)
+    if match_ms and not _is_expiration_mode_label(text):
+        mm = int(match_ms.group(1))
+        ss = int(match_ms.group(2))
+        total = mm * 60 + ss
+        return total if 1 <= total <= 3600 else None
+
+    return None
 
 
 def _score_asset_result(raw_text: str, target_key: str, require_otc: bool) -> int:

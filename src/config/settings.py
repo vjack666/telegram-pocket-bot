@@ -85,6 +85,16 @@ class AppSettings:
     masaniello_manager_ops_total: int           # operaciones por sesión
     masaniello_manager_wins_needed: int         # ITM necesarios para ganar sesión
     masaniello_manager_max_gale_mult: int       # techo Macro-Gale (ej. 16 = x1..x16)
+    # ── Modo Híbrido (Bot + Humano) ────────────────────────────────────────
+    g2_human_approval: bool          # True = pausa en G2 y espera APROBAR/CANCELAR del usuario
+    g2_approval_timeout_seconds: int # segundos para responder antes de cancelar automáticamente
+    session_learning_db_path: str    # ruta del JSONL de aprendizaje de sesiones
+    operation_mode_schedule_enabled: bool  # alterna HIBRIDO/AUTOMATICO por horario
+    operation_mode_hybrid_start_hour: int  # inicio HIBRIDO en hora de señales (UTC-3)
+    operation_mode_hybrid_end_hour: int    # fin HIBRIDO en hora de señales (UTC-3)
+    operation_mode_sound_alert: bool       # alerta sonora cuando cambia el modo
+    # ── Manual Operations ──────────────────────────────────────────────────
+    manual_operations_enabled: bool        # activar registro de operaciones manuales
 
     @staticmethod
     def load() -> "AppSettings":
@@ -242,6 +252,27 @@ class AppSettings:
             ),
             masaniello_manager_max_gale_mult=int(
                 os.getenv("APP_MASANIELLO_MANAGER_MAX_GALE_MULT", "16")
+            ),
+            g2_human_approval=_to_bool(os.getenv("APP_G2_HUMAN_APPROVAL", "false")),
+            g2_approval_timeout_seconds=int(os.getenv("APP_G2_APPROVAL_TIMEOUT_SECONDS", "20")),
+            session_learning_db_path=os.getenv(
+                "APP_SESSION_LEARNING_DB_PATH",
+                "runtime/session_learning.jsonl",
+            ).strip(),
+            operation_mode_schedule_enabled=_to_bool(
+                os.getenv("APP_OPERATION_MODE_SCHEDULE_ENABLED", "true")
+            ),
+            operation_mode_hybrid_start_hour=int(
+                os.getenv("APP_OPERATION_MODE_HYBRID_START_HOUR", "10")
+            ),
+            operation_mode_hybrid_end_hour=int(
+                os.getenv("APP_OPERATION_MODE_HYBRID_END_HOUR", "21")
+            ),
+            operation_mode_sound_alert=_to_bool(
+                os.getenv("APP_OPERATION_MODE_SOUND_ALERT", "true")
+            ),
+            manual_operations_enabled=_to_bool(
+                os.getenv("APP_MANUAL_OPERATIONS_ENABLED", "false")
             ),
         )
 

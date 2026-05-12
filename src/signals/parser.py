@@ -78,6 +78,20 @@ class SignalParser:
             r"\b(VICTORIA\s+DIRECTA|VICTORIA\s+EN\s+1(?:A|ª)?|VICTORIA\s+EN\s+2(?:A|ª)?|PERDIDA|P[EÉ]RDIDA|LOSS|WIN)\b",
             re.IGNORECASE,
         )
+        # Patrones para extraer horarios de sesión: "Sesión: 09:00-17:00" o "INICIA: 09:00 TERMINA: 17:00"
+        self._session_time_range_re = re.compile(
+            r"(?:SESION|SESSION|SESIÓN)\s*[:=]?\s*(\d{1,2})[:\.](\d{2})\s*[-–—]\s*(\d{1,2})[:\.](\d{2})",
+            re.IGNORECASE,
+        )
+        self._session_start_end_re = re.compile(
+            r"(?:INICIA|COMIENZA|START|STARTS)\s*[:=]?\s*(\d{1,2})[:\.](\d{2})\s*(?:.*?)\s*(?:TERMINA|FINALIZA|END|ENDS)\s*[:=]?\s*(\d{1,2})[:\.](\d{2})",
+            re.IGNORECASE | re.DOTALL,
+        )
+        # Patrón para detectar mensajes de alerta de sesión: "LA SESIÓN COMIENZA A LAS 19:00 (UTC -3)"
+        self._session_alert_start_re = re.compile(
+            r"(?:LA\s+)?(?:SESION|SESSION|SESIÓN)\s+(?:COMIENZA|EMPIEZA|STARTS?|BEGINS?)\s+A\s+LAS\s+(\d{1,2}):?(\d{2})",
+            re.IGNORECASE,
+        )
         # Códigos de moneda y cripto reconocidos. Cualquier par que no use
         # exclusivamente estos códigos se descarta como falso positivo.
         self._known_currencies = {
@@ -157,6 +171,8 @@ class SignalParser:
             execute_at_utc,
             received,
         )
+        # Extraer horarios de sesión si están presentes en el mensaje
+        session_start_utc, session_end_utc = self._extract_session_times(norm_text, received)
 
         return TradingSignal(
             asset=asset,
@@ -167,6 +183,8 @@ class SignalParser:
             received_at=received,
             execute_at_utc=execute_at_utc,
             martingale_execute_at_utc=martingale_execute_at_utc,
+            session_start_utc=session_start_utc,
+            session_end_utc=session_end_utc,
         )
 
     def is_result_message(self, raw_text: str) -> bool:
@@ -296,6 +314,79 @@ class SignalParser:
             result.append(scheduled_local.astimezone(timezone.utc))
 
         return tuple(result)
+
+    def _extract_session_times(
+        self,
+        norm_text: str,
+        received_at_utc: datetime,
+    ) -> tuple[datetime | None, datetime | None]:
+        """Extrae horarios de sesión (inicio/fin) del texto y los convierte a UTC.
+        
+        Soporta formatos:
+        - "Sesión: 09:00-17:00"
+        - "INICIA: 09:00 ... TERMINA: 17:00"
+        - "LA SESIÓN COMIENZA A LAS 19:00 (UTC -3)"
+        
+        Retorna (session_start_utc, session_end_utc) convertidos a UTC.
+        Si solo se encuentra inicio, end será None.
+        """
+        base_local = received_at_utc.astimezone(self._signal_tz)
+        
+        # Intenta match de rango: "Sesión: 09:00-17:00"
+        range_match = self._session_time_range_re.search(norm_text)
+        if range_match:
+            start_hour, start_min = int(range_match.group(1)), int(range_match.group(2))
+            end_hour, end_min = int(range_match.group(3)), int(range_match.group(4))
+            
+            if start_hour > 23 or start_min > 59 or end_hour > 23 or end_min > 59:
+                return (None, None)
+            
+            start_local = base_local.replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
+            end_local = base_local.replace(hour=end_hour, minute=end_min, second=0, microsecond=0)
+            
+            # Si el fin es anterior al inicio el mismo día, ajustar al siguiente
+            if end_local < start_local:
+                end_local += timedelta(days=1)
+            
+            return (start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc))
+        
+        # Intenta match de inicio/fin separado: "INICIA: 09:00 ... TERMINA: 17:00"
+        start_end_match = self._session_start_end_re.search(norm_text)
+        if start_end_match:
+            start_hour, start_min = int(start_end_match.group(1)), int(start_end_match.group(2))
+            end_hour, end_min = int(start_end_match.group(3)), int(start_end_match.group(4))
+            
+            if start_hour > 23 or start_min > 59 or end_hour > 23 or end_min > 59:
+                return (None, None)
+            
+            start_local = base_local.replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
+            end_local = base_local.replace(hour=end_hour, minute=end_min, second=0, microsecond=0)
+            
+            # Si el fin es anterior al inicio, ajustar al siguiente día
+            if end_local < start_local:
+                end_local += timedelta(days=1)
+            
+            return (start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc))
+        
+        # Intenta match de alerta de sesión: "LA SESIÓN COMIENZA A LAS 19:00"
+        alert_match = self._session_alert_start_re.search(norm_text)
+        if alert_match:
+            start_hour = int(alert_match.group(1))
+            start_min = int(alert_match.group(2))
+            
+            if start_hour > 23 or start_min > 59:
+                return (None, None)
+            
+            start_local = base_local.replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
+            
+            # Si la hora de inicio es en el pasado hoy, asumir que es para mañana
+            if start_local < base_local:
+                start_local += timedelta(days=1)
+            
+            # Retornar solo start, end será None
+            return (start_local.astimezone(timezone.utc), None)
+        
+        return (None, None)
 
 
 def _normalize_for_match(text: str) -> str:

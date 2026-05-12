@@ -172,6 +172,40 @@ def print_countdown_line(
     _COUNTDOWN_ACTIVE = True
 
 
+def print_countdown_line_mmss(
+    step_name: str,
+    asset: str,
+    side: str,
+    amount: float,
+    mm_total: int,
+    ss: int,
+    semaphore: str,
+    color_output: bool = True,
+) -> None:
+    """Versión compacta de countdown en formato MM:SS (sin hora)."""
+    global _COUNTDOWN_ACTIVE
+    mm_total = max(0, int(mm_total))
+    ss = max(0, min(59, int(ss)))
+
+    if color_output:
+        step_col = _paint(f"[{step_name}]", C.BOLD, C.YELLOW)
+        asset_col = _paint(asset, C.CYAN)
+        side_col = _paint(side, C.GREEN if side in {"BUY", "CALL", "UP"} else C.RED)
+        amt_col = _paint(f"${amount:.2f}", C.WHITE)
+        timer_col = _paint(f"{mm_total:02d}:{ss:02d}", C.BOLD, C.WHITE)
+        sem_col = _semaphore_badge(semaphore)
+        line = f"\r  {step_col} {asset_col} {side_col}  {amt_col}  t {timer_col}  {sem_col}  "
+    else:
+        line = (
+            f"\r  [{step_name}] {asset} {side}  ${amount:.2f}"
+            f"  {mm_total:02d}:{ss:02d}  {semaphore}  "
+        )
+
+    pad = max(0, _w() - len(_strip_ansi(line)) - 1)
+    print(line + " " * pad, end="", flush=True)
+    _COUNTDOWN_ACTIVE = True
+
+
 def print_order_event(
     event: str,
     step_name: str,

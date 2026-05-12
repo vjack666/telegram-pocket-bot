@@ -70,6 +70,8 @@ class LiveTradeSnapshot:
     close_price: float | None = None
     open_price_decimals: int | None = None
     close_price_decimals: int | None = None
+    amount: float | None = None
+    time_remaining_sec: int | None = None
 
     @property
     def status(self) -> str:
@@ -229,6 +231,8 @@ class TradePanelFeed:
 
         open_price, open_price_decimals = self._extract_named_price(text, r"OPEN\s*PRICE")
         close_price, close_price_decimals = self._extract_named_price(text, r"CLOSING\s*PRICE")
+        amount = self._extract_trade_amount(text)
+        time_remaining_sec = self._extract_time_remaining_sec(text)
 
         if pnl_value > 0:
             confidence += 15
@@ -246,7 +250,51 @@ class TradePanelFeed:
             close_price=close_price,
             open_price_decimals=open_price_decimals,
             close_price_decimals=close_price_decimals,
+            amount=amount,
+            time_remaining_sec=time_remaining_sec,
         )
+
+    @staticmethod
+    def _extract_trade_amount(text: str) -> float | None:
+        compact = " ".join((text or "").split())
+
+        labeled = re.search(
+            r"(?:INVEST(?:MENT)?|AMOUNT|TRADE\s*AMOUNT|STAKE)\s*[:=]?\s*\$\s*(\d+(?:[.,]\d+)?)",
+            compact,
+            re.IGNORECASE,
+        )
+        if labeled:
+            return _parse_number(labeled.group(1))
+
+        values = _extract_currency_numbers(compact)
+        if not values:
+            return None
+
+        # En la mayoria de layouts el primer monto en $ de la tarjeta abierta es el stake.
+        return values[0]
+
+    @staticmethod
+    def _extract_time_remaining_sec(text: str) -> int | None:
+        compact = " ".join((text or "").split())
+        best: int | None = None
+
+        for match in re.finditer(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b", compact):
+            p1 = int(match.group(1))
+            p2 = int(match.group(2))
+            p3 = match.group(3)
+
+            if p3 is not None:
+                p3n = int(p3)
+                total = p1 * 3600 + p2 * 60 + p3n
+            else:
+                total = p1 * 60 + p2
+
+            # Filtra horas de reloj y valores absurdos.
+            if 1 <= total <= 3600:
+                if best is None or total < best:
+                    best = total
+
+        return best
 
     @staticmethod
     def _normalize_side(side: str | None) -> str | None:

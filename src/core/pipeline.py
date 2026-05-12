@@ -588,6 +588,8 @@ class SignalProcessor:
                     item.envelope.message_id,
                     message,
                 )
+                # Cancelaciones esperables (entrada vencida, desalineacion, etc.)
+                # NO deben tumbar todo el runtime ni forzar reinicio de navegador.
             else:
                 logging.exception(
                     "Error en ejecucion de señal canal='%s' msg_id=%s: %s",
@@ -595,10 +597,10 @@ class SignalProcessor:
                     item.envelope.message_id,
                     exc,
                 )
-            self._request_restart(
-                f"RuntimeError en ejecucion de señal canal={item.envelope.source_name or item.envelope.chat_id} "
-                f"msg_id={item.envelope.message_id}: {message}"
-            )
+                self._request_restart(
+                    f"RuntimeError en ejecucion de señal canal={item.envelope.source_name or item.envelope.chat_id} "
+                    f"msg_id={item.envelope.message_id}: {message}"
+                )
         except Exception as exc:
             logging.exception(
                 "Error en ejecucion de señal canal='%s' msg_id=%s: %s",

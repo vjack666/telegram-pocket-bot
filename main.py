@@ -24,8 +24,11 @@ from src.core.masaniello_manager import MasanielloManager
 from src.core.pipeline import MessageQueue, SignalProcessor, StateManager, GlobalGaleState, MasanielloSessionState, RecoveryProfile
 from src.core.equity_bands import EquityBandManager
 from src.core.daily_profit_tracker import DailyProfitTracker
+from src.core.manual_operation_tracker import ManualOperationTracker
+from src.core.manual_operation_cli import ManualOperationCLI
 from src.pocket_option.client import PocketOptionDemoClient
 from src.utils.blackbox import DeferredBlackBoxRecorder, ShutdownSnapshot
+from src.utils.session_learning_db import SessionLearningDB
 from src.utils.logger import setup_logging
 
 
@@ -246,6 +249,33 @@ async def run() -> None:
         _set_run_phase("running")
         logging.info("Navegador Pocket Option abierto. Resuelve CAPTCHA/login en esa ventana si aparece.")
 
+        # Ajustar el saldo inicial para cumplir con la meta de $2 adicionales o redondear a número par
+        initial_balance = await pocket_client.get_account_balance()
+        adjusted_balance = round(initial_balance)
+        if adjusted_balance % 2 != 0:
+            adjusted_balance += 1  # Asegurar que sea par
+
+        logging.info("Ajustando el saldo inicial: actual=%.2f ajustado=%.2f", initial_balance, adjusted_balance)
+
+        # Calcular el monto necesario para alcanzar el próximo número par (+2 desde base ajustada).
+        # El broker requiere mínimo $1. Fórmula: bet = needed_gain / payout_decimal
+        # Ejemplo: saldo=125.01 → ajustado=126 → target=128 → needed=2.99 → bet=2.99/0.92=3.25
+        _payout_decimal = max(0.01, settings.calc_payout_percent / 100.0)
+        target_balance = adjusted_balance + 2
+        needed = max(0.0, target_balance - initial_balance)
+        next_amount = needed / _payout_decimal if needed > 0 else 0.0
+        next_amount = round(next_amount, 2)
+        # Respetar mínimo del broker ($1). Si needed=0 (ya está en número par), no se necesita ajuste.
+        if 0 < next_amount < 1.0:
+            next_amount = 1.0
+            logging.info("[Startup] Monto ajustado al mínimo del broker: $1.00")
+
+        logging.info(
+            "Monto inicial calculado para cumplir meta: $%.2f (saldo=%.2f → target par=%.2f)",
+            next_amount, initial_balance, target_balance,
+        )
+        # _next_entry_override se aplicará después de inicializar engine
+
         balance = await _wait_for_demo_balance(
             pocket_client, timeout_seconds=settings.pocket_balance_wait_seconds
         )
@@ -264,7 +294,7 @@ async def run() -> None:
                 bands=settings.equity_bands,
                 upgrade_sessions_required=settings.equity_band_upgrade_sessions,
                 daily_target_pct=settings.equity_daily_target_pct,
-                initial_balance=balance,
+                initial_balance=adjusted_balance,
                 state_path=settings.equity_state_path if settings.equity_state_persist else None,
                 deposit_guard_enabled=settings.equity_deposit_guard_enabled,
                 deposit_guard_jump_pct=settings.equity_deposit_jump_pct,
@@ -407,6 +437,33 @@ async def run() -> None:
             )
             shutdown_event.set()
 
+        # Si el usuario opera con click manual en broker, no debe bloquear por aprobación G2.
+        effective_g2_human_approval = bool(settings.g2_human_approval and settings.pocket_execute_orders)
+        if settings.g2_human_approval and not settings.pocket_execute_orders:
+            logging.info(
+                "G2_HUMAN_APPROVAL ignorado en modo manual (POCKET_EXECUTE_ORDERS=false). "
+                "El motor solo esperará WIN/LOSS."
+            )
+
+        # ── Manual Operation Tracker ───────────────────────────────────────
+        manual_operation_tracker = None
+        if settings.manual_operations_enabled:
+            manual_operation_tracker = ManualOperationTracker(
+                global_gale_state=global_gale_state,
+                masaniello_session=masaniello_session,
+            )
+            logging.info(
+                "[ManualOperations] ACTIVO | Sistema de registro de operaciones manuales habilitado"
+            )
+            _blackbox.record(
+                "manual_operations_enabled",
+                component="manual_operation_tracker",
+            )
+        else:
+            logging.info(
+                "[ManualOperations] DESACTIVO (APP_MANUAL_OPERATIONS_ENABLED=false)"
+            )
+
         engine = SignalEngine(
             pocket_client=pocket_client,
             martingale_amounts=settings.martingale_amounts,
@@ -427,7 +484,22 @@ async def run() -> None:
             event_recorder=_blackbox.record,
             equity_manager=equity_manager,
             daily_profit_tracker=daily_profit_tracker,
+            manual_operation_tracker=manual_operation_tracker,
         )
+        # Aplicar next_entry_override calculado al inicio
+        engine._next_entry_override = next_amount
+        logging.info("[Engine] next_entry_override inicial aplicado: %.2f", next_amount)
+
+        # ── Escribir monto inicial en la caja amount del broker ──────────────
+        # El monto prioritario es el de Masaniello si está activo; si no, el calculado.
+        _startup_amount = engine._next_entry_override if engine._next_entry_override else next_amount
+        if _startup_amount and _startup_amount > 0:
+            try:
+                await pocket_client.set_amount(_startup_amount, max_retries=3)
+                logging.info("[Startup] Monto inicial escrito en broker: $%.2f", _startup_amount)
+            except Exception as _exc:
+                logging.warning("[Startup] No se pudo escribir monto inicial en broker: %s", _exc)
+
         processor = SignalProcessor(
             message_queue=message_queue,
             parser=parser,
@@ -446,6 +518,26 @@ async def run() -> None:
         )
         worker_tasks = processor.start()
         _blackbox.record("worker_tasks_started", component="signal_processor", count=len(worker_tasks))
+
+        # ── Monitor automático de operaciones manuales (sin API) ─────────────
+        # Detecta cambios de saldo por operaciones manuales del usuario,
+        # actualiza Masaniello y escribe el siguiente monto en el broker.
+        _balance_monitor_task = asyncio.create_task(
+            engine.start_balance_monitor(poll_interval=2.5, min_change=0.5),
+            name="balance_monitor",
+        )
+        worker_tasks.append(_balance_monitor_task)
+        logging.info("[BalanceMonitor] Tarea de monitoreo de saldo iniciada.")
+
+        # ── Manual Operation CLI (opcional) ────────────────────────────────
+        if settings.manual_operations_enabled and manual_operation_tracker is not None:
+            manual_cli = ManualOperationCLI(tracker=manual_operation_tracker)
+            logging.info(
+                "[ManualOperationsCLI] Sistema interactivo listo. "
+                "Puedes registrar operaciones manuales en cualquier momento durante la ejecución."
+            )
+        else:
+            manual_cli = None
 
         backfill_minutes = settings.telegram_backfill_minutes
         backfill_limit = settings.telegram_backfill_limit
