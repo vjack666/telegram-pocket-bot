@@ -173,6 +173,8 @@ class MasanielloSessionState:
         self._wins: int = 0
         self._losses: int = 0
         self._session_blocked: bool = False
+        self._result_history: list[str] = []
+        self._state_change_callback: Callable[["MasanielloSessionState", str], None] | None = None
 
     @property
     def wins(self) -> int:
@@ -185,6 +187,10 @@ class MasanielloSessionState:
     @property
     def signals_consumed(self) -> int:
         return self._wins + self._losses
+
+    @property
+    def result_history(self) -> list[str]:
+        return self._result_history.copy()
 
     @property
     def is_session_over(self) -> bool:
@@ -203,17 +209,68 @@ class MasanielloSessionState:
         """Devuelve la apuesta de entrada Masaniello para el estado actual."""
         return self._masaniello_stake(self._base_balance, self._losses, self._wins)
 
+    def set_state_change_callback(
+        self,
+        callback: Callable[["MasanielloSessionState", str], None] | None,
+    ) -> None:
+        """Registra callback para persistencia/autosave en cada cambio de estado."""
+        self._state_change_callback = callback
+
+    def to_dict(self) -> dict[str, Any]:
+        """Snapshot serializable del estado de sesion."""
+        return {
+            "wins": self._wins,
+            "losses": self._losses,
+            "signals_consumed": self.signals_consumed,
+            "is_session_blocked": self._session_blocked,
+            "result_history": self._result_history,
+            "n_ops": self._n_ops,
+            "w_needed": self._w_needed,
+            "max_losses": self._max_losses,
+            "base_balance": self._base_balance,
+            "payout_mult": self._payout_mult,
+        }
+
+    def restore_state(
+        self,
+        wins: int,
+        losses: int,
+        session_blocked: bool,
+        result_history: list[str] | None = None,
+        notify: bool = True,
+    ) -> None:
+        """Restaura estado desde persistencia."""
+        self._wins = max(0, int(wins))
+        self._losses = max(0, int(losses))
+        self._session_blocked = bool(session_blocked)
+        history = result_history or []
+        self._result_history = [str(item) for item in history if str(item) in {"W", "L"}][-200:]
+        if notify:
+            self._notify_state_change("restore_state")
+
+    def reset_session(self, reason: str = "manual_reset", notify: bool = True) -> None:
+        """Resetea estado de sesion (conteo e historial)."""
+        self._wins = 0
+        self._losses = 0
+        self._session_blocked = False
+        self._result_history = []
+        if notify:
+            self._notify_state_change(f"reset:{reason}")
+
+    def _notify_state_change(self, reason: str) -> None:
+        if self._state_change_callback is None:
+            return
+        try:
+            self._state_change_callback(self, reason)
+        except Exception:
+            logging.exception("MasanielloSession callback fallo (reason=%s)", reason)
+
     def record_win(self) -> None:
         """Registra una victoria de señal (WD, G1 o G2). Reinicia sesion si completa."""
         self._wins += 1
         self._session_blocked = False  # un win desbloquea la sesion
-        logging.info(
-            "MasanielloSession WIN: wins=%d losses=%d consumed=%d/%d",
-            self._wins,
-            self._losses,
-            self.signals_consumed,
-            self._n_ops,
-        )
+        self._result_history.append("W")
+        self._result_history = self._result_history[-200:]
         if self.is_session_over:
             logging.info(
                 "MasanielloSession: sesion COMPLETADA (wins=%d). Reiniciando.",
@@ -221,6 +278,11 @@ class MasanielloSessionState:
             )
             self._wins = 0
             self._losses = 0
+            self._session_blocked = False
+            self._result_history = []
+            self._notify_state_change("record_win_session_over_reset")
+            return
+        self._notify_state_change("record_win")
 
     def record_loss(self) -> None:
         """Registra una perdida de señal completa (L). Reinicia sesion si agotada.
@@ -230,13 +292,8 @@ class MasanielloSessionState:
         maxima por sesion sin afectar timing ni pipeline de ejecucion.
         """
         self._losses += 1
-        logging.info(
-            "MasanielloSession LOSS: wins=%d losses=%d consumed=%d/%d",
-            self._wins,
-            self._losses,
-            self.signals_consumed,
-            self._n_ops,
-        )
+        self._result_history.append("L")
+        self._result_history = self._result_history[-200:]
         if self._losses >= self._max_losses:
             logging.warning(
                 "MasanielloSession: LOSS GUARD activado (losses=%d >= max=%d). "
@@ -247,6 +304,8 @@ class MasanielloSessionState:
             self._session_blocked = True
             self._wins = 0
             self._losses = 0
+            self._result_history = []
+            self._notify_state_change("record_loss_guard_reset")
             return
         if self.is_session_over:
             logging.info(
@@ -255,6 +314,11 @@ class MasanielloSessionState:
             )
             self._wins = 0
             self._losses = 0
+            self._session_blocked = False
+            self._result_history = []
+            self._notify_state_change("record_loss_session_over_reset")
+            return
+        self._notify_state_change("record_loss")
 
     def update_base(self, new_base: float) -> None:
         """Actualiza la base de sizing Masaniello (llamado por EquityBandManager)."""
@@ -358,19 +422,28 @@ class GlobalGaleState:
             self._accumulated_loss,
         )
     
-    def reset_for_new_signal(self, current_balance: float) -> None:
+    def reset_for_new_signal(self, current_balance: float, inherit_manual_loss: bool = False) -> None:
         """Llamar al inicio de cada señal nueva.
-        Siempre reinicia el ciclo desde cero con $14 de entrada.
-        La deuda de señales anteriores NO se acumula entre señales.
+        
+        Comportamiento de acumulación según contexto:
+        - inherit_manual_loss=False (default): ciclo fresco, sin deuda previa
+        - inherit_manual_loss=True: hereda accumulated_loss de operaciones manuales
+          para que el primer trade sea un Gale de recuperación si es necesario.
+        
         Los gales dentro de cada señal se calculan al inicio de la misma.
         """
+        previous_loss = self._accumulated_loss if inherit_manual_loss else 0.0
+        
         self._is_active = False
         self._current_step = 0
         self._cycle_start_balance = current_balance
-        self._accumulated_loss = 0.0
+        self._accumulated_loss = previous_loss
+        
         logging.info(
-            "GlobalGaleState: Nueva señal - ciclo fresco. balance=%.2f",
+            "GlobalGaleState: Nueva señal - ciclo %s | balance=%.2f accumulated_loss=%.2f",
+            "con herencia de pérdida manual" if inherit_manual_loss and previous_loss > 0 else "fresco",
             current_balance,
+            self._accumulated_loss,
         )
 
     def record_win(self) -> None:

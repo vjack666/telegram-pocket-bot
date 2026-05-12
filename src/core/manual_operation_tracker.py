@@ -66,6 +66,7 @@ class ManualOperationTracker:
         result: Literal["WIN", "LOSS", "UNKNOWN"],
         balance_after: float | None = None,
         notes: str = "",
+        apply_state: bool = True,
     ) -> ManualOperation:
         """
         Registra una operación manual y actualiza el estado de Masaniello.
@@ -94,7 +95,12 @@ class ManualOperationTracker:
 
         self._history.append(op)
 
-        # Actualizar estado de Masaniello
+        # Actualizar estado solo cuando este tracker es la fuente del resultado
+        # (ej. uso manual por CLI). En deteccion automatica desde engine,
+        # apply_state=False para evitar doble conteo.
+        if not apply_state:
+            return op
+
         if result == "WIN":
             logging.info(
                 "📊 Operación manual WIN registrada: %s %s $%.2f | "

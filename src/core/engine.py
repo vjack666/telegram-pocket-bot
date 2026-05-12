@@ -195,6 +195,9 @@ class SignalEngine:
                             result=result,
                             balance_before=float(pending_manual["before_balance"]),
                             balance_after=current,
+                            asset=pending_manual.get("asset_hint"),
+                            side=pending_manual.get("side_hint"),
+                            amount=pending_manual.get("amount_hint"),
                         )
                         pending_manual = None
                     else:
@@ -244,6 +247,9 @@ class SignalEngine:
                     result="W",
                     balance_before=last_balance,
                     balance_after=current,
+                    asset=None,
+                    side=None,
+                    amount=None,
                 )
 
             except asyncio.CancelledError:
@@ -441,41 +447,156 @@ class SignalEngine:
         result: str,
         balance_before: float,
         balance_after: float,
+        asset: str | None = None,
+        side: str | None = None,
+        amount: float | None = None,
     ) -> None:
+        """
+        Reconciliación total de operación manual.
+        
+        Este método es el PUNTO CENTRAL donde una intervención manual se integra
+        completamente en el estado global del bot. Actualiza:
+        - GlobalGaleState (accumulated_loss, current_step, target_balance)
+        - MasanielloSession (wins/losses para conteo de sesión)
+        - ManualOperationTracker (historial auditable)
+        - Masaniello Manager (próximo stake)
+        
+        Args:
+            result: "W" (WIN) o "L" (LOSS)
+            balance_before: Saldo antes de la operación
+            balance_after: Saldo después de la operación
+            asset: Activo (ej: "EURUSD OTC") - extraído de snapshot si es posible
+            side: "BUY" o "SELL" - extraído de snapshot si es posible
+            amount: Monto arriesgado - extraído de snapshot si es posible
+        """
         result_label = "WIN" if result == "W" else "LOSS"
         emoji = "✅ GANADA" if result == "W" else "❌ PERDIDA"
         diff = balance_after - balance_before
+        
+        # Estimar monto si no fue pasado
+        if amount is None:
+            amount = abs(balance_before - balance_after) if diff < 0 else abs(diff)
+        if asset is None:
+            asset = "EURUSD OTC"  # fallback default
+        if side is None:
+            side = "BUY"  # fallback default
+        
         logging.info(
-            "[BalanceMonitor] ⏸️  CIERRE DETECTADO - Operación manual %s | cambio=$%.2f "
-            "(saldo: %.2f → %.2f)",
+            "[BalanceMonitor] ⏸️  CIERRE DETECTADO - Operación manual %s | "
+            "%s %s $%.2f | cambio=$%.2f (saldo: %.2f → %.2f)",
             emoji,
+            side,
+            asset,
+            amount,
             diff,
             balance_before,
             balance_after,
         )
-        self._emit_event(
-            "manual_trade_detected",
-            result=result,
-            balance_before=balance_before,
-            balance_after=balance_after,
-            diff=diff,
-        )
-
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # PASO 1: SINCRONIZACIÓN CON GLOBAL GALE STATE
+        # ─────────────────────────────────────────────────────────────────────
+        # Actualizar el estado de riesgo global inmediatamente.
+        # El bot SIENTE esta operación en su gestión de martingala.
+        
+        if result == "W":
+            self._global_gale.record_win()
+        else:  # result == "L"
+            self._global_gale.record_loss(amount)
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # PASO 2: SINCRONIZACIÓN CON MASANIELLO SESSION
+        # ─────────────────────────────────────────────────────────────────────
+        # Actualizar contador de wins/losses en la sesión actual
+        # para que el próximo trade calcule correctamente
+        
+        if self._masaniello_session is not None:
+            if result == "W":
+                self._masaniello_session.record_win()
+            else:
+                self._masaniello_session.record_loss()
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # PASO 3: REGISTRO EN MANUAL OPERATION TRACKER
+        # ─────────────────────────────────────────────────────────────────────
+        # Crear registro auditable formal de la intervención manual
+        
+        if self._manual_operation_tracker is not None:
+            op = self._manual_operation_tracker.register_manual_operation(
+                asset=asset,
+                side=side,
+                amount=amount,
+                balance_before=balance_before,
+                result=result_label,
+                balance_after=balance_after,
+                notes="Detección automática por monitor de balance",
+                apply_state=False,
+            )
+            op_timestamp = op.timestamp.isoformat() if op.timestamp is not None else "unknown"
+            logging.info(
+                "[BalanceMonitor] Manual registrada en tracker: id=%s",
+                op_timestamp,
+            )
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # PASO 4: ACTUALIZACIÓN DE MASANIELLO MANAGER (PRÓXIMO STAKE)
+        # ─────────────────────────────────────────────────────────────────────
+        # Calcular el siguiente monto a apostar basado en este resultado
+        
         if self._masaniello_manager is not None:
             self._ultimo_resultado = result
             self._next_entry_override = self._masaniello_manager.get_next_stake(result)
             self._log_masaniello_next_entry(self._next_entry_override)
+            
             if self._next_entry_override and self._next_entry_override > 0:
                 try:
                     await self._pocket_client.set_amount(self._next_entry_override, max_retries=2)
                     logging.info(
-                        "[BalanceMonitor] Siguiente monto Masaniello escrito: $%.2f",
+                        "[BalanceMonitor] 💰 Siguiente monto Masaniello escrito: $%.2f",
                         self._next_entry_override,
                     )
                 except Exception as exc:
                     logging.warning(
-                        "[BalanceMonitor] No se pudo escribir monto en broker: %s", exc
+                        "[BalanceMonitor] ⚠️  No se pudo escribir monto en broker: %s", exc
                     )
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # PASO 5: EVENTO AGREGADO PARA LISTENERS EXTERNOS
+        # ─────────────────────────────────────────────────────────────────────
+        
+        self._emit_event(
+            "manual_trade_reconciled",
+            result=result,
+            balance_before=balance_before,
+            balance_after=balance_after,
+            diff=diff,
+            asset=asset,
+            side=side,
+            amount=amount,
+            global_gale_state={
+                "is_active": self._global_gale.is_active,
+                "current_step": self._global_gale.current_step,
+                "accumulated_loss": self._global_gale.accumulated_loss,
+                "cycle_start_balance": self._global_gale.cycle_start_balance,
+                "target_balance": self._global_gale.target_balance,
+            },
+            masaniello_session={
+                "wins": self._masaniello_session.wins if self._masaniello_session else None,
+                "losses": self._masaniello_session.losses if self._masaniello_session else None,
+                "signals_consumed": self._masaniello_session.signals_consumed if self._masaniello_session else None,
+                "is_session_blocked": self._masaniello_session.is_session_blocked if self._masaniello_session else None,
+            } if self._masaniello_session else None,
+        )
+        
+        logging.info(
+            "[BalanceMonitor] Reconciliación manual aplicada | "
+            "Global(step=%d loss=%.2f target=%.2f) Masaniello(%d/%d)",
+            self._global_gale.current_step,
+            self._global_gale.accumulated_loss,
+            self._global_gale.target_balance,
+            self._masaniello_session.wins if self._masaniello_session else 0,
+            self._masaniello_session.losses if self._masaniello_session else 0,
+        )
 
     async def execute_signal(self, signal: TradingSignal) -> None:
         self._bot_trade_in_progress = True
@@ -489,19 +610,26 @@ class SignalEngine:
         start_step = 0
         operation_mode = self._refresh_operation_mode(signal)
 
-        # Toda señal nueva entra por ENTRADA (step=0).
-        # Si hay pérdidas acumuladas de señales anteriores, se conservan para el cálculo de montos.
-        self._global_gale.reset_for_new_signal(before_cycle_balance)
+        # Fuente unica de verdad para heredar deuda: GlobalGaleState.
+        should_inherit_manual_loss = self._global_gale.accumulated_loss > 0
+        
+        self._global_gale.reset_for_new_signal(
+            before_cycle_balance, 
+            inherit_manual_loss=should_inherit_manual_loss
+        )
+        
         # Resetear estado de aprendizaje del ciclo
         self._cycle_sequence = ""
         self._cycle_g2_intervened = False
         self._cycle_g2_approved = None
         self._cycle_g2_amount = None
         logging.info(
-            "Nueva señal inicia en ENTRADA (step=0) | balance=%.2f accumulated_loss=%.2f target=%.2f",
+            "Nueva señal inicia en ENTRADA (step=0) | balance=%.2f accumulated_loss=%.2f target=%.2f | "
+            "inherit_manual_loss=%s",
             before_cycle_balance,
             self._global_gale.accumulated_loss,
             self._global_gale.target_balance,
+            should_inherit_manual_loss,
         )
         
         cycle_amounts = self._build_cycle_amounts(before_cycle_balance)
@@ -707,6 +835,8 @@ class SignalEngine:
                     if tracker_status.get("meta_just_reached"):
                         logging.info("[Daily Meta] ✓ META ALCANZADA: $%.2f | Modo DEFENSIVO activado", 
                                    tracker_status.get("daily_pnl", 0))
+                        if self._masaniello_session is not None:
+                            self._masaniello_session.reset_session(reason="daily_target_reached")
                 
                 self._emit_event(
                     "trade_result_win",
@@ -747,6 +877,8 @@ class SignalEngine:
                                tracker_status.get("daily_target", 0),
                                tracker_status.get("progress_pct", 0),
                                "DEFENSIVO" if tracker_status.get("defensive_mode") else "NORMAL")
+                    if tracker_status.get("meta_just_reached") and self._masaniello_session is not None:
+                        self._masaniello_session.reset_session(reason="daily_target_reached")
                 
                 self._emit_event(
                     "trade_result_loss",

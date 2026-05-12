@@ -26,6 +26,7 @@ from src.core.equity_bands import EquityBandManager
 from src.core.daily_profit_tracker import DailyProfitTracker
 from src.core.manual_operation_tracker import ManualOperationTracker
 from src.core.manual_operation_cli import ManualOperationCLI
+from src.core.masaniello_session_persistence import MasanielloSessionPersistence
 from src.pocket_option.client import PocketOptionDemoClient
 from src.utils.blackbox import DeferredBlackBoxRecorder, ShutdownSnapshot
 from src.utils.session_learning_db import SessionLearningDB
@@ -381,6 +382,70 @@ async def run() -> None:
             base_balance=_initial_masaniello_base,
             payout_mult=settings.calc_payout_percent / 100.0 + 1.0,
             max_losses=settings.masaniello_max_session_losses,
+        )
+        masaniello_state_path = _RUNTIME_BASE_DIR / "masaniello" / "session_state.json"
+        masaniello_persistence = MasanielloSessionPersistence(str(masaniello_state_path))
+        should_reset_by_daily_target = bool(
+            daily_profit_tracker is not None and daily_profit_tracker.meta_reached
+        )
+        load_info = masaniello_persistence.load_into_session(
+            masaniello_session,
+            reset_if_daily_target_reached=should_reset_by_daily_target,
+        )
+        masaniello_save_task: asyncio.Task | None = None
+        pending_reason: str | None = None
+
+        def _schedule_masaniello_save(session: MasanielloSessionState, reason: str) -> None:
+            nonlocal masaniello_save_task, pending_reason
+            pending_reason = reason
+
+            if masaniello_save_task is not None and not masaniello_save_task.done():
+                return
+
+            async def _drain_saves() -> None:
+                nonlocal masaniello_save_task, pending_reason
+                try:
+                    while pending_reason is not None:
+                        current_reason = pending_reason
+                        pending_reason = None
+                        snapshot = session.to_dict()
+                        await asyncio.to_thread(
+                            masaniello_persistence.save_snapshot,
+                            snapshot,
+                            current_reason,
+                        )
+                finally:
+                    masaniello_save_task = None
+
+            try:
+                loop = asyncio.get_running_loop()
+                masaniello_save_task = loop.create_task(_drain_saves(), name="masaniello_state_save")
+            except RuntimeError:
+                # Fallback defensivo fuera de loop asyncio.
+                masaniello_persistence.save_session(session, reason)
+
+        masaniello_session.set_state_change_callback(_schedule_masaniello_save)
+        # Garantiza archivo actualizado en arranque incluso cuando no haya cambios inmediatos.
+        masaniello_persistence.save_session(masaniello_session, reason="startup_sync")
+        logging.info(
+            "[MasanielloPersist] %s | path=%s | wins=%d losses=%d consumed=%d blocked=%s",
+            "estado restaurado" if load_info.get("loaded") else f"estado reiniciado ({load_info.get('reason')})",
+            masaniello_state_path,
+            masaniello_session.wins,
+            masaniello_session.losses,
+            masaniello_session.signals_consumed,
+            masaniello_session.is_session_blocked,
+        )
+        _blackbox.record(
+            "masaniello_session_loaded",
+            component="masaniello_persistence",
+            loaded=bool(load_info.get("loaded")),
+            reason=str(load_info.get("reason", "unknown")),
+            wins=masaniello_session.wins,
+            losses=masaniello_session.losses,
+            signals_consumed=masaniello_session.signals_consumed,
+            blocked=masaniello_session.is_session_blocked,
+            path=str(masaniello_state_path),
         )
         # Caja negra de stake: no toca scheduling/async; solo entrega el siguiente monto.
         masaniello_manager = MasanielloManager(
