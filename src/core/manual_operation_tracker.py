@@ -17,7 +17,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
 
-from src.core.pipeline import GlobalGaleState, MasanielloSessionState
+from src.core.pipeline import GlobalGaleState
+from src.core.session_manager import SessionManager
 
 
 @dataclass
@@ -44,17 +45,17 @@ class ManualOperationTracker:
     Responsabilidades:
     - Registrar entrada manual (asset, side, amount)
     - Registrar resultado (WIN/LOSS) tras cierre
-    - Actualizar GlobalGaleState y MasanielloSessionState
+    - Actualizar GlobalGaleState y SessionManager
     - Persistir historia para auditoría
     """
 
     def __init__(
         self,
         global_gale_state: GlobalGaleState,
-        masaniello_session: MasanielloSessionState | None = None,
+        session_manager: SessionManager | None = None,
     ) -> None:
         self._gale_state = global_gale_state
-        self._masaniello_session = masaniello_session
+        self._session_manager = session_manager
         self._history: list[ManualOperation] = []
 
     def register_manual_operation(
@@ -110,8 +111,8 @@ class ManualOperationTracker:
                 amount,
             )
             self._gale_state.record_win()
-            if self._masaniello_session is not None:
-                self._masaniello_session.record_win()
+            if self._session_manager is not None:
+                self._session_manager.update_session_status("WIN")
 
         elif result == "LOSS":
             loss_amount = balance_before - (balance_after or balance_before - amount)
@@ -124,8 +125,11 @@ class ManualOperationTracker:
                 loss_amount,
             )
             self._gale_state.record_loss(amount)
-            if self._masaniello_session is not None:
-                self._masaniello_session.record_loss()
+            if self._session_manager is not None:
+                self._session_manager.update_session_status(
+                    "LOSS",
+                    debt_after_loss=self._gale_state.accumulated_loss,
+                )
 
         else:
             logging.warning(

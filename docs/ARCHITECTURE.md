@@ -102,6 +102,7 @@ Bot de trading automatizado que escucha señales desde canales de Telegram y eje
 
 ### `src/core/engine.py`
 - `SignalEngine` — ejecuta señales con lógica de martingala
+- En automático usa SessionManager (objetivo por sesión) para sizing dinámico
 - Serializa todas las operaciones del broker con `asyncio.Lock` (`_broker_lock`)
 - Maneja countdown hasta la entrada, envío de orden y monitoreo del resultado
 - Ver [SIGNAL_FLOW.md](SIGNAL_FLOW.md) y [MARTINGALE_MODES.md](MARTINGALE_MODES.md)

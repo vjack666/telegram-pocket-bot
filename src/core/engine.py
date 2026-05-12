@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import math
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -16,8 +15,8 @@ from src.core.console_hub import (
 from src.pocket_option.assets import canonicalize_pocket_asset, normalize_asset_for_compare
 from src.pocket_option.client import PocketOptionBaseClient
 from src.pocket_option.trade_panel_feed import LiveTradeSnapshot
-from src.core.masaniello_manager import MasanielloManager
-from src.core.pipeline import MasanielloSessionState, RecoveryProfile
+from src.core.session_manager import SessionManager
+from src.core.recovery_profile import RecoveryProfile
 from src.core.equity_bands import EquityBandManager
 from src.core.daily_profit_tracker import DailyProfitTracker
 from src.utils.session_learning_db import SessionLearningDB
@@ -39,8 +38,7 @@ class SignalEngine:
         color_output: bool,
         signal_late_tolerance_seconds: int,
         global_gale_state: Any,
-        masaniello_session: MasanielloSessionState | None = None,
-        masaniello_manager: MasanielloManager | None = None,
+        session_manager: SessionManager | None = None,
         recovery_profile: RecoveryProfile | None = None,
         calc_base_balance: float = 300.0,
         event_recorder: Callable[..., None] | None = None,
@@ -59,12 +57,16 @@ class SignalEngine:
         operation_mode_hybrid_end_hour: int = 21,
         operation_mode_sound_alert: bool = True,
         manual_operation_tracker: ManualOperationTracker | None = None,
+        pocket_min_order_amount: float = 1.0,
+        masaniello_loss_brake_enabled: bool = True,
+        masaniello_loss_brake_window_minutes: int = 180,
+        masaniello_loss_brake_step: float = 0.25,
+        masaniello_loss_brake_floor: float = 0.25,
     ) -> None:
         self._pocket_client = pocket_client
         self._martingale_amounts = [value for value in martingale_amounts if value > 0] or [2.0, 4.0, 10.0]
-        self._martingale_mode = martingale_mode if martingale_mode in {"fixed", "calculator", "masaniello"} else "fixed"
-        self._masaniello_session = masaniello_session
-        self._masaniello_manager = masaniello_manager
+        self._martingale_mode = "session"
+        self._session_manager = session_manager
         self._calc_payout = max(0.01, calc_payout_percent / 100.0)
         self._calc_increment = max(1, calc_increment)
         self._calc_rule10_threshold = max(0.0, calc_rule10_balance_threshold)
@@ -103,7 +105,6 @@ class SignalEngine:
         self._session_base_max = max(1.0, float(session_base_max))
         self._scaling_anchor_balance: float | None = None
         self._ultimo_resultado: str | None = None
-        self._next_entry_override: float | None = None
         # Modo híbrido: freno de aprobación humana en G2
         self._g2_human_approval = g2_human_approval
         self._g2_approval_timeout_seconds = max(5, int(g2_approval_timeout_seconds))
@@ -118,10 +119,6 @@ class SignalEngine:
         self._cycle_g2_intervened: bool = False
         self._cycle_g2_approved: bool | None = None
         self._cycle_g2_amount: float | None = None
-        if self._masaniello_manager is not None:
-            # Precalcular stake inicial para no introducir latencia en el disparo.
-            self._next_entry_override = self._masaniello_manager.get_next_stake(None)
-            self._log_masaniello_next_entry(self._next_entry_override)
         # CRITICAL FIX: Broker-level lock to serialize all browser operations
         self._broker_lock = asyncio.Lock()
         
@@ -143,6 +140,15 @@ class SignalEngine:
         self._manual_operation_tracker = manual_operation_tracker
         # Flag: el bot está en medio de una operación propia (para ignorar ese cambio de saldo)
         self._bot_trade_in_progress: bool = False
+        self._pocket_min_order_amount = max(0.01, float(pocket_min_order_amount))
+        # Freno automático por racha de pérdidas recientes (ventana deslizante)
+        self._masaniello_loss_brake_enabled = bool(masaniello_loss_brake_enabled)
+        self._masaniello_loss_brake_window = timedelta(
+            minutes=max(1, int(masaniello_loss_brake_window_minutes))
+        )
+        self._masaniello_loss_brake_step = max(0.0, float(masaniello_loss_brake_step))
+        self._masaniello_loss_brake_floor = max(0.05, min(1.0, float(masaniello_loss_brake_floor)))
+        self._recent_cycle_loss_times: list[datetime] = []
 
     async def start_balance_monitor(
         self,
@@ -364,29 +370,100 @@ class SignalEngine:
         if sys.stdout.isatty():
             clear_countdown_line()
 
+    def _prune_recent_cycle_losses(self, now_utc: datetime) -> None:
+        cutoff = now_utc - self._masaniello_loss_brake_window
+        self._recent_cycle_loss_times = [
+            ts for ts in self._recent_cycle_loss_times if ts >= cutoff
+        ]
+
+    def _register_cycle_loss(self, now_utc: datetime | None = None) -> None:
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+        self._recent_cycle_loss_times.append(now_utc)
+        self._prune_recent_cycle_losses(now_utc)
+
+    def _loss_brake_multiplier(self, now_utc: datetime | None = None) -> float:
+        if not self._masaniello_loss_brake_enabled:
+            return 1.0
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+        self._prune_recent_cycle_losses(now_utc)
+        losses_recent = len(self._recent_cycle_loss_times)
+        multiplier = 1.0 - (losses_recent * self._masaniello_loss_brake_step)
+        return max(self._masaniello_loss_brake_floor, min(1.0, multiplier))
+
+    def _apply_broker_amount_floor(self, amount: float) -> float:
+        return round(max(self._pocket_min_order_amount, float(amount)), 2)
+
+    def _sync_session_loss_from_global(self) -> None:
+        if self._session_manager is None:
+            return
+        if hasattr(self._session_manager, "sync_accumulated_loss"):
+            try:
+                self._session_manager.sync_accumulated_loss(self._global_gale.accumulated_loss)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _session_result_label(step_name: str, won: bool) -> str:
+        if not won:
+            return "LOSS"
+        if step_name == "ENTRADA":
+            return "WIN DIRECTO"
+        if step_name == "MARTINGALA 1":
+            return "G1"
+        return "G2"
+
+    def _alert_session_stop_loss(self) -> None:
+        message = "Sesión Finalizada por Stop Loss - Capital Protegido"
+        clear_countdown_line()
+        logging.error(message)
+        print(f"\n[ALERTA] {message}")
+        self._emit_event("session_stop_loss_triggered", message=message)
+
+    def _update_session_after_result(self, step_name: str, won: bool) -> None:
+        if self._session_manager is None:
+            return
+
+        result_label = self._session_result_label(step_name, won)
+        debt_after_loss = self._global_gale.accumulated_loss if not won else None
+        status = self._session_manager.update_session_status(
+            result_label,
+            debt_after_loss=debt_after_loss,
+        )
+        if status.get("stop_triggered"):
+            self._alert_session_stop_loss()
+
     async def _prefill_manual_loss_amount(self, pending_manual: dict[str, Any]) -> None:
         """Prefill cómodo: escribir monto provisional asumiendo LOSS manual, sin mutar estado real."""
-        if self._masaniello_manager is None:
+        if self._session_manager is None:
             return
         if pending_manual.get("prefill_loss_written"):
             return
 
         try:
-            next_if_loss = float(self._masaniello_manager.preview_next_stake("L"))
+            next_if_loss = float(self._session_manager.peek_next_stake_if_loss())
         except Exception as exc:
             logging.debug("[BalanceMonitor] No se pudo previsualizar stake post-loss manual: %s", exc)
             return
 
-        if next_if_loss <= 0:
+        multiplier = self._loss_brake_multiplier()
+        adjusted_next_if_loss = self._apply_broker_amount_floor(next_if_loss * multiplier)
+
+        if adjusted_next_if_loss <= 0:
             return
 
         try:
-            await self._pocket_client.set_amount(next_if_loss, max_retries=2)
+            await self._pocket_client.set_amount(adjusted_next_if_loss, max_retries=2)
             pending_manual["prefill_loss_written"] = True
-            pending_manual["prefill_loss_amount"] = next_if_loss
+            pending_manual["prefill_loss_amount"] = adjusted_next_if_loss
             logging.info(
-                "[BalanceMonitor] Prefill manual (si pierde) escrito: $%.2f",
+                "[BalanceMonitor] Prefill manual (si pierde) escrito: $%.2f "
+                "(raw=%.2f, mult=%.2f, losses_3h=%d)",
+                adjusted_next_if_loss,
                 next_if_loss,
+                multiplier,
+                len(self._recent_cycle_loss_times),
             )
         except Exception as exc:
             logging.warning(
@@ -503,18 +580,13 @@ class SignalEngine:
             self._global_gale.record_win()
         else:  # result == "L"
             self._global_gale.record_loss(amount)
+            self._register_cycle_loss()
+        self._sync_session_loss_from_global()
         
         # ─────────────────────────────────────────────────────────────────────
-        # PASO 2: SINCRONIZACIÓN CON MASANIELLO SESSION
+        # PASO 2: SINCRONIZACIÓN CON SESSION MANAGER
         # ─────────────────────────────────────────────────────────────────────
-        # Actualizar contador de wins/losses en la sesión actual
-        # para que el próximo trade calcule correctamente
-        
-        if self._masaniello_session is not None:
-            if result == "W":
-                self._masaniello_session.record_win()
-            else:
-                self._masaniello_session.record_loss()
+        self._update_session_after_result("ENTRADA", won=(result == "W"))
         
         # ─────────────────────────────────────────────────────────────────────
         # PASO 3: REGISTRO EN MANUAL OPERATION TRACKER
@@ -539,26 +611,22 @@ class SignalEngine:
             )
         
         # ─────────────────────────────────────────────────────────────────────
-        # PASO 4: ACTUALIZACIÓN DE MASANIELLO MANAGER (PRÓXIMO STAKE)
+        # PASO 4: PREFILL DEL SIGUIENTE STAKE DESDE SESSION MANAGER
         # ─────────────────────────────────────────────────────────────────────
-        # Calcular el siguiente monto a apostar basado en este resultado
-        
-        if self._masaniello_manager is not None:
-            self._ultimo_resultado = result
-            self._next_entry_override = self._masaniello_manager.get_next_stake(result)
-            self._log_masaniello_next_entry(self._next_entry_override)
-            
-            if self._next_entry_override and self._next_entry_override > 0:
-                try:
-                    await self._pocket_client.set_amount(self._next_entry_override, max_retries=2)
-                    logging.info(
-                        "[BalanceMonitor] 💰 Siguiente monto Masaniello escrito: $%.2f",
-                        self._next_entry_override,
-                    )
-                except Exception as exc:
-                    logging.warning(
-                        "[BalanceMonitor] ⚠️  No se pudo escribir monto en broker: %s", exc
-                    )
+        if self._session_manager is not None:
+            try:
+                next_amount = self._session_manager.get_next_stake(self._pocket_min_order_amount)
+                await self._pocket_client.set_amount(next_amount, max_retries=2)
+                logging.info(
+                    "[BalanceMonitor] 💰 Siguiente monto SessionManager escrito: $%.2f "
+                    "(min_broker=%.2f)",
+                    next_amount,
+                    self._pocket_min_order_amount,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "[BalanceMonitor] ⚠️  No se pudo escribir monto en broker: %s", exc
+                )
         
         # ─────────────────────────────────────────────────────────────────────
         # PASO 5: EVENTO AGREGADO PARA LISTENERS EXTERNOS
@@ -580,22 +648,22 @@ class SignalEngine:
                 "cycle_start_balance": self._global_gale.cycle_start_balance,
                 "target_balance": self._global_gale.target_balance,
             },
-            masaniello_session={
-                "wins": self._masaniello_session.wins if self._masaniello_session else None,
-                "losses": self._masaniello_session.losses if self._masaniello_session else None,
-                "signals_consumed": self._masaniello_session.signals_consumed if self._masaniello_session else None,
-                "is_session_blocked": self._masaniello_session.is_session_blocked if self._masaniello_session else None,
-            } if self._masaniello_session else None,
+            session_manager={
+                "wins": self._session_manager.wins if self._session_manager else None,
+                "losses": self._session_manager.losses if self._session_manager else None,
+                "signals_consumed": self._session_manager.signals_consumed if self._session_manager else None,
+                "is_session_blocked": self._session_manager.session_blocked if self._session_manager else None,
+            } if self._session_manager else None,
         )
         
         logging.info(
             "[BalanceMonitor] Reconciliación manual aplicada | "
-            "Global(step=%d loss=%.2f target=%.2f) Masaniello(%d/%d)",
+            "Global(step=%d loss=%.2f target=%.2f) Session(%d/%d)",
             self._global_gale.current_step,
             self._global_gale.accumulated_loss,
             self._global_gale.target_balance,
-            self._masaniello_session.wins if self._masaniello_session else 0,
-            self._masaniello_session.losses if self._masaniello_session else 0,
+            self._session_manager.wins if self._session_manager else 0,
+            self._session_manager.losses if self._session_manager else 0,
         )
 
     async def execute_signal(self, signal: TradingSignal) -> None:
@@ -606,9 +674,20 @@ class SignalEngine:
             self._bot_trade_in_progress = False
 
     async def _run_martingale_flow(self, signal: TradingSignal) -> None:
+        if self._session_manager is not None and self._session_manager.global_stop:
+            self._alert_session_stop_loss()
+            self._emit_event(
+                "global_stop_active",
+                asset=signal.asset,
+                side=signal.side,
+                blocks_lost_today=self._session_manager.blocks_lost_today,
+            )
+            return
+
         before_cycle_balance = await self._safe_get_balance()
         start_step = 0
         operation_mode = self._refresh_operation_mode(signal)
+        await self._refresh_dynamic_payout(signal.asset)
 
         # Fuente unica de verdad para heredar deuda: GlobalGaleState.
         should_inherit_manual_loss = self._global_gale.accumulated_loss > 0
@@ -617,6 +696,7 @@ class SignalEngine:
             before_cycle_balance, 
             inherit_manual_loss=should_inherit_manual_loss
         )
+        self._sync_session_loss_from_global()
         
         # Resetear estado de aprendizaje del ciclo
         self._cycle_sequence = ""
@@ -669,7 +749,6 @@ class SignalEngine:
 
         # Actualizar capital operativo dinámico tras cada ciclo completo
         await self._apply_equity_update()
-        await self.check_balance_scaling()
 
     def _allowed_entry_delay_seconds(self, step_name: str) -> float:
         """Ventana máxima de atraso permitida por tipo de paso.
@@ -745,8 +824,6 @@ class SignalEngine:
         if changed:
             new_base = self._equity_manager.operational_base
             self._calc_base_balance = new_base
-            if self._masaniello_session is not None:
-                self._masaniello_session.update_base(new_base)
             self._emit_event(
                 "equity_band_changed",
                 balance=balance,
@@ -823,9 +900,7 @@ class SignalEngine:
                 logging.info("Resultado: WIN en %s. Se detiene martingala.", step_name)
                 self._cycle_sequence += "W"  # tracking de aprendizaje
                 self._global_gale.record_win()
-                if self._masaniello_session is not None:
-                    self._masaniello_session.record_win()
-                self._update_masaniello_manager_after_result("W")
+                self._update_session_after_result(step_name, won=True)
                 
                 # Registrar en daily profit tracker
                 pnl_win = round(amount * self._calc_payout, 2)
@@ -835,8 +910,8 @@ class SignalEngine:
                     if tracker_status.get("meta_just_reached"):
                         logging.info("[Daily Meta] ✓ META ALCANZADA: $%.2f | Modo DEFENSIVO activado", 
                                    tracker_status.get("daily_pnl", 0))
-                        if self._masaniello_session is not None:
-                            self._masaniello_session.reset_session(reason="daily_target_reached")
+                        if self._session_manager is not None:
+                            self._session_manager.reset_session(reason="daily_target_reached", clear_stop_flags=True)
                 
                 self._emit_event(
                     "trade_result_win",
@@ -862,9 +937,8 @@ class SignalEngine:
                 logging.warning("Resultado: LOSS en %s. Gale continuará en siguiente señal.", step_name)
                 self._cycle_sequence += "L"  # tracking de aprendizaje
                 self._global_gale.record_loss(amount)
-                if self._masaniello_session is not None:
-                    self._masaniello_session.record_loss()
-                self._update_masaniello_manager_after_result("L")
+                self._register_cycle_loss()
+                self._update_session_after_result(step_name, won=False)
                 
                 # Registrar en daily profit tracker (pérdida)
                 pnl_loss = round(-amount, 2)
@@ -877,8 +951,8 @@ class SignalEngine:
                                tracker_status.get("daily_target", 0),
                                tracker_status.get("progress_pct", 0),
                                "DEFENSIVO" if tracker_status.get("defensive_mode") else "NORMAL")
-                    if tracker_status.get("meta_just_reached") and self._masaniello_session is not None:
-                        self._masaniello_session.reset_session(reason="daily_target_reached")
+                    if tracker_status.get("meta_just_reached") and self._session_manager is not None:
+                        self._session_manager.reset_session(reason="daily_target_reached", clear_stop_flags=True)
                 
                 self._emit_event(
                     "trade_result_loss",
@@ -1112,9 +1186,7 @@ class SignalEngine:
             logging.info("Resultado: WIN en %s. Se detiene martingala.", current_step_name)
             self._cycle_sequence += "W"  # tracking de aprendizaje
             self._global_gale.record_win()
-            if self._masaniello_session is not None:
-                self._masaniello_session.record_win()
-            self._update_masaniello_manager_after_result("W")
+            self._update_session_after_result(current_step_name, won=True)
             self._emit_event(
                 "trade_result_win",
                 asset=signal.asset,
@@ -1702,6 +1774,32 @@ class SignalEngine:
             logging.debug("No se pudo leer snapshot vivo de Trade para %s %s: %s", asset, side, exc)
             return None
 
+    async def _refresh_dynamic_payout(self, asset: str | None) -> None:
+        """Intenta sincronizar payout real del broker para cálculo de montos/PnL."""
+        try:
+            payout_percent = await self._pocket_client.get_current_payout_percent(asset)
+        except Exception as exc:
+            logging.debug("No se pudo leer payout dinámico (%s): %s", asset, exc)
+            return
+
+        if payout_percent is None:
+            return
+
+        payout_net = max(0.01, float(payout_percent) / 100.0)
+        if abs(payout_net - self._calc_payout) < 1e-9:
+            return
+
+        old_percent = self._calc_payout * 100.0
+        self._calc_payout = payout_net
+        logging.info(
+            "Payout dinámico sincronizado: %.2f%% -> %.2f%% (asset=%s)",
+            old_percent,
+            payout_percent,
+            asset or "N/A",
+        )
+        if self._session_manager is not None:
+            self._session_manager.update_payout_mult(1.0 + payout_net)
+
     def _print_waiting_summary(
         self,
         signal: TradingSignal,
@@ -1806,250 +1904,46 @@ class SignalEngine:
         return f"{local.strftime('%H:%M:%S')} UTC{offset_hours:+d}"
 
     def _build_cycle_amounts(self, current_balance: float) -> list[float]:
-        if self._martingale_mode == "masaniello" and self._masaniello_session is not None:
-            if self._masaniello_manager is not None:
-                return self._masaniello_manager_amounts()
-            if self._masaniello_session.is_session_blocked:
+        if self._session_manager is not None:
+            self._sync_session_loss_from_global()
+            if self._session_manager.session_blocked:
                 logging.warning(
-                    "MasanielloSession bloqueada (MAX_LOSSES GUARD). "
+                    "SessionManager bloqueado por guard de pérdidas. "
                     "Usando amounts cero para skip de senial. "
                     "El bloqueo se libera en el proximo WIN."
                 )
                 # Devuelve stakes minimos: el engine los ejecutara pero seran $0.01 (dry-safe).
                 # Esto preserva el pipeline de timing intacto; el riesgo financiero es nulo.
                 return [0.01, 0.01, 0.01]
-            return self._masaniello_amounts(current_balance)
-        if self._martingale_mode != "calculator":
-            return list(self._martingale_amounts)
-        return self._calculator_amounts(current_balance)
-
-    def _update_masaniello_manager_after_result(self, result: str) -> None:
-        """Actualiza estado de caja negra inmediatamente al cerrar una señal."""
-        if self._masaniello_manager is None:
-            return
-        self._ultimo_resultado = result
-        self._next_entry_override = self._masaniello_manager.get_next_stake(self._ultimo_resultado)
-        self._ultimo_resultado = None
-        self._log_masaniello_next_entry(self._next_entry_override)
+            return self._session_amounts()
+        return list(self._martingale_amounts)
 
     async def check_balance_scaling(self) -> None:
-        """Escala la base de sesion Masaniello por hitos de balance.
+        """Deshabilitado: modo bloque fijo ignora crecimiento de saldo del broker."""
+        return
 
-        Regla:
-        - Cada +$50 desde el ancla inicial del proceso, sube +15% la base de sesion.
-        - Tope de base: $60.
-        """
-        if self._masaniello_manager is None:
-            return
-        try:
-            current_balance = await self._safe_get_balance()
-        except Exception as exc:
-            logging.debug("Scaling Masaniello: no se pudo leer balance (%s)", exc)
-            return
-
-        if self._scaling_anchor_balance is None:
-            self._scaling_anchor_balance = current_balance
-            return
-
-        growth = current_balance - self._scaling_anchor_balance
-        if growth < self._balance_scaling_step:
-            return
-
-        levels = int(growth // self._balance_scaling_step)
-        if self._session_base_increment is not None:
-            target_base = self._masaniello_manager.initial_session_base_capital + (
-                levels * self._session_base_increment
-            )
-        else:
-            growth_mult = (1.0 + self._session_base_growth_pct) ** levels
-            target_base = self._masaniello_manager.initial_session_base_capital * growth_mult
-        target_base = min(target_base, self._session_base_max)
-        prev_base = self._masaniello_manager.session_base_capital
-
-        if target_base <= prev_base:
-            return
-
-        if not self._masaniello_manager.set_session_base_capital(target_base):
-            return
-
-        # Fuerza recálculo inmediato para la próxima entrada con la nueva base.
-        self._next_entry_override = self._masaniello_manager.get_next_stake(None)
-        self._log_masaniello_next_entry(self._next_entry_override)
-
-        growth_msg = (
-            f"Nuevo hito alcanzado: Stake de sesion incrementado a ${target_base:.2f} "
-            f"(balance=${current_balance:.2f}, base_previa=${prev_base:.2f})"
-        )
-        logging.info(growth_msg)
-        self._emit_event(
-            "masaniello_scaling_hito",
-            message=growth_msg,
-            balance=current_balance,
-            growth=growth,
-            balance_step=self._balance_scaling_step,
-            base_previous=prev_base,
-            base_new=target_base,
-        )
-
-    def _log_masaniello_next_entry(self, stake: float) -> None:
-        if self._masaniello_manager is None:
-            return
-        snap = self._masaniello_manager.snapshot()
-        logging.info(
-            "Masaniello -> Siguiente entrada: $%.2f | Estado Sesion: (W: %d, L: %d)",
-            stake,
-            snap.itms,
-            snap.otms,
-        )
-
-    def _masaniello_manager_amounts(self) -> list[float]:
-        """Calcula [entry, G1, G2] desde MasanielloManager sin tocar timing."""
-        assert self._masaniello_manager is not None
-
-        if self._next_entry_override is None:
-            self._next_entry_override = self._masaniello_manager.get_next_stake(self._ultimo_resultado)
-            self._ultimo_resultado = None
-            self._log_masaniello_next_entry(self._next_entry_override)
-
-        entry = max(0.01, round(self._next_entry_override, 2))
-        g1_mult = self._recovery_profile.g1_mult
-        g2_mult = self._recovery_profile.g2_mult
-        amounts = [
-            entry,
-            round(entry * g1_mult, 2),
-            round(entry * g2_mult, 2),
-        ]
-        return amounts
-
-    def _masaniello_amounts(self, current_balance: float) -> list[float]:
-        """Calcula [entry, G1, G2] usando la formula Masaniello para el estado actual de sesion.
-
-        CAP TOTAL: el cap_pct se aplica sobre la exposicion TOTAL de la senial
-        (entry + G1 + G2), no sobre cada paso individualmente.
-
-        Con payout=92%: total_mult = 1 + (1.92/0.92) + (1.92/0.92)^2 ≈ 7.44
-        entry_max = base * cap_pct / total_mult
-        → garantiza que entry + G1 + G2 ≤ base * cap_pct en el peor caso.
-
-        Esto NO afecta timing ni pipeline; solo cambia el tamano de las ordenes.
-        """
-        assert self._masaniello_session is not None
-        entry_raw = self._masaniello_session.current_entry_stake()
-        base = self._masaniello_session._base_balance
-        g1_mult = self._recovery_profile.g1_mult
-        g2_mult = self._recovery_profile.g2_mult
-        cap_pct = self._recovery_profile.max_trade_pct
-
-        # Exposicion total si se juegan los 3 pasos: entry * (1 + g1 + g2)
-        total_mult = 1.0 + g1_mult + g2_mult
-        # entry maxima tal que entry * total_mult == base * cap_pct
-        cap_total = round(max(0.01, base * cap_pct), 2)
-        entry_max = round(cap_total / total_mult, 4)
-
-        entry = round(min(entry_raw, entry_max), 2)
-        entry = max(0.01, entry)
+    def _session_amounts(self) -> list[float]:
+        """Calcula [entry, G1, G2] exclusivamente desde SessionManager."""
+        assert self._session_manager is not None
+        entry = self._session_manager.get_next_stake(self._pocket_min_order_amount)
 
         amounts = [
             entry,
-            round(entry * g1_mult, 2),
-            round(entry * g2_mult, 2),
-        ]
-        cap_was_active = entry_raw > entry_max
-        logging.info(
-            "Masaniello %d/%d: señal %d/%d wins=%d losses=%d "
-            "entry_raw=%.2f entry_capped=%.2f cap_total=%.2f(%.0f%%) "
-            "total_mult=%.4f g1x=%.4f g2x=%.4f amounts=%s%s",
-            self._masaniello_session._n_ops,
-            self._masaniello_session._w_needed,
-            self._masaniello_session.signals_consumed + 1,
-            self._masaniello_session._n_ops,
-            self._masaniello_session.wins,
-            self._masaniello_session.losses,
-            entry_raw,
             entry,
-            cap_total,
-            cap_pct * 100,
-            total_mult,
-            g1_mult,
-            g2_mult,
+            entry,
+        ]
+        logging.info(
+            "Sesion %d/%d: señal %d/%d wins=%d losses=%d "
+            "entry=%.2f (source=SessionManager.get_next_stake) amounts=%s",
+            self._session_manager.n_ops,
+            self._session_manager.w_needed,
+            self._session_manager.signals_consumed + 1,
+            self._session_manager.n_ops,
+            self._session_manager.wins,
+            self._session_manager.losses,
+            entry,
             amounts,
-            " [CAP TOTAL ACTIVO]" if cap_was_active else "",
         )
-        return amounts
-
-    def _calculator_amounts(self, start_balance: float) -> list[float]:
-        """Calcula montos del modo calculator usando la lógica de Calculadora-Binarias.
-
-        Reglas aplicadas:
-        - Objetivo por escalones: floor(balance) + incremento.
-        - Tras cada pérdida simulada, siguiente monto = (objetivo - balance_actual) / payout.
-        - Regla 10%: cuando balance > threshold, si el siguiente monto redondeado
-          alcanza el límite floor(balance * 0.10), se reinicia el ciclo en ese punto
-          recalculando objetivo desde el balance actual.
-                - Sin cap extra por paso: el control de riesgo principal es la regla 10%.
-
-        Esta función solo define sizing; no altera el pipeline de timing/scheduling.
-        """
-        working_balance = max(0.0, float(start_balance))
-        target = float(math.floor(working_balance) + self._calc_increment)
-        amounts: list[float] = []
-
-        logging.info(
-            "Calculator escalonado: start_balance=%.2f target=%.2f payout=%.4f threshold=%.2f steps=%d",
-            working_balance,
-            target,
-            self._calc_payout,
-            self._calc_rule10_threshold,
-            self._calc_max_steps,
-        )
-
-        for step_idx in range(self._calc_max_steps):
-            needed = max(0.0, target - working_balance)
-            raw_amount = (needed / self._calc_payout) if self._calc_payout > 0 else 0.0
-            next_amount = max(0.01, raw_amount)
-
-            if step_idx > 0 and working_balance > self._calc_rule10_threshold:
-                limit_10 = math.floor(working_balance * 0.10)
-                if limit_10 > 0 and round(next_amount) >= limit_10:
-                    prev_target = target
-                    target = float(math.floor(working_balance) + self._calc_increment)
-                    needed = max(0.0, target - working_balance)
-                    raw_amount = (needed / self._calc_payout) if self._calc_payout > 0 else 0.0
-                    next_amount = max(0.01, raw_amount)
-                    logging.info(
-                        "Calculator reset por riesgo (step=%d): next≈%.2f >= limit10=%d | target %.2f → %.2f",
-                        step_idx,
-                        round(raw_amount, 2),
-                        limit_10,
-                        prev_target,
-                        target,
-                    )
-
-            # Ajustar el monto para garantizar incrementos exactos de $2 y redondear a números enteros pares
-            amount = round(next_amount, 2)
-            amount = max(0.01, amount)
-            amounts.append(amount)
-
-            # Simular pérdida del paso para precomputar el siguiente monto de la cadena
-            working_balance = max(0.0, working_balance - amount)
-
-            # Ajustar el balance al final del ciclo para que sea un número entero y preferiblemente par
-            if step_idx == self._calc_max_steps - 1:
-                adjusted_balance = round(working_balance)
-                if adjusted_balance % 2 != 0:
-                    adjusted_balance += 1  # Asegurar que sea par
-                working_balance = adjusted_balance
-
-            logging.info(
-                "Calculator step=%d balance=%.2f target=%.2f needed=%.2f raw=%.2f amount=%.2f",
-                step_idx,
-                working_balance,
-                target,
-                needed,
-                raw_amount,
-                amount,
-            )
-
         return amounts
 
     @staticmethod
@@ -2122,3 +2016,4 @@ class SignalEngine:
             "mg": "\033[95m",
         }
         return palette.get(kind, "\033[37m")
+

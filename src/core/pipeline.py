@@ -1,3 +1,4 @@
+from src.core.session_manager import SessionManager as MasanielloSessionState
 import asyncio
 import logging
 import shutil
@@ -71,10 +72,8 @@ class StateManager:
         self._dedupe_ttl_seconds = max(60, dedupe_ttl_seconds)
         self._seen: dict[str, datetime] = {}
         self._order: deque[str] = deque()
-        self._active_count: int = 0  # número de señales ejecutándose ahora
-        # CRITICAL FIX: Track active channels to prevent simultaneous signals from same channel
-        self._active_channels: set[int] = set()  # set of chat_ids currently executing
-        # CRITICAL FIX: Use lock for atomic channel operations (prevent race conditions)
+        self._active_count: int = 0
+        self._active_channels: set[int] = set()
         self._channel_lock = asyncio.Lock()
 
     @property
@@ -92,17 +91,14 @@ class StateManager:
         return self._active_count
 
     async def is_channel_active(self, chat_id: int) -> bool:
-        """Check if a channel (chat_id) already has an active signal (atomic operation)."""
         async with self._channel_lock:
             return chat_id in self._active_channels
 
     async def mark_channel_active(self, chat_id: int) -> None:
-        """Mark a channel as having an active signal (atomic operation)."""
         async with self._channel_lock:
             self._active_channels.add(chat_id)
 
     async def mark_channel_inactive(self, chat_id: int) -> None:
-        """Mark a channel as no longer having an active signal (atomic operation)."""
         async with self._channel_lock:
             self._active_channels.discard(chat_id)
 
@@ -110,7 +106,6 @@ class StateManager:
         self._evict_old(now_utc)
         if key in self._seen:
             return True
-
         self._seen[key] = now_utc
         self._order.append(key)
         return False
@@ -127,244 +122,6 @@ class StateManager:
                 break
             self._order.popleft()
             self._seen.pop(oldest, None)
-
-
-@dataclass(frozen=True)
-class RecoveryProfile:
-    """Perfil de sizing/recovery configurable, independiente del modo operativo.
-
-    Aplica el cap de exposición a TODOS los pasos (entrada, G1, G2) en
-    todos los modos. Los multiplicadores g1_mult / g2_mult son usados por
-    el modo 'calculator'; Masaniello los usa solo como referencia de gale.
-
-    Regla de cap: siempre min(raw_stake, cap) ANTES de round(), para
-    evitar excesos por rounding.
-    """
-
-    g1_mult: float             # multiplicador de G1 sobre entrada
-    g2_mult: float             # multiplicador de G2 sobre entrada
-    max_trade_pct: float       # cap por operación individual (ej: 0.10 = 10%)
-    max_total_exposure_pct: float  # cap de exposición acumulada — reservado para RiskEngine futuro
-
-
-class MasanielloSessionState:
-    """Tracks Masaniello session state across signals.
-
-    Una sesion = N_OPS señales. La sesion se considera ganada cuando
-    se acumulan W_NEEDED victorias. Al finalizar (wins >= W o
-    signals >= N), la sesion se reinicia automaticamente.
-    La apuesta de entrada de cada señal se calcula con la formula
-    de Masaniello usando el balance base fijo de $300.
-    """
-
-    def __init__(
-        self,
-        n_ops: int = 12,
-        w_needed: int = 4,
-        base_balance: float = 300.0,
-        payout_mult: float = 1.92,
-        max_losses: int = 3,
-    ) -> None:
-        self._n_ops = max(1, n_ops)
-        self._w_needed = max(1, w_needed)
-        self._base_balance = max(1.0, base_balance)
-        self._payout_mult = max(1.01, payout_mult)
-        self._max_losses = max(1, max_losses)
-        self._wins: int = 0
-        self._losses: int = 0
-        self._session_blocked: bool = False
-        self._result_history: list[str] = []
-        self._state_change_callback: Callable[["MasanielloSessionState", str], None] | None = None
-
-    @property
-    def wins(self) -> int:
-        return self._wins
-
-    @property
-    def losses(self) -> int:
-        return self._losses
-
-    @property
-    def signals_consumed(self) -> int:
-        return self._wins + self._losses
-
-    @property
-    def result_history(self) -> list[str]:
-        return self._result_history.copy()
-
-    @property
-    def is_session_over(self) -> bool:
-        return self._wins >= self._w_needed or self.signals_consumed >= self._n_ops
-
-    @property
-    def is_session_blocked(self) -> bool:
-        """True cuando la sesion fue cortada por exceso de perdidas (MAX_SESSION_LOSSES).
-
-        El engine DEBE consultar esto antes de calcular montos; si esta bloqueada,
-        la sesion se descarta sin ejecutar trade. No afecta timing ni pipeline.
-        """
-        return self._session_blocked
-
-    def current_entry_stake(self) -> float:
-        """Devuelve la apuesta de entrada Masaniello para el estado actual."""
-        return self._masaniello_stake(self._base_balance, self._losses, self._wins)
-
-    def set_state_change_callback(
-        self,
-        callback: Callable[["MasanielloSessionState", str], None] | None,
-    ) -> None:
-        """Registra callback para persistencia/autosave en cada cambio de estado."""
-        self._state_change_callback = callback
-
-    def to_dict(self) -> dict[str, Any]:
-        """Snapshot serializable del estado de sesion."""
-        return {
-            "wins": self._wins,
-            "losses": self._losses,
-            "signals_consumed": self.signals_consumed,
-            "is_session_blocked": self._session_blocked,
-            "result_history": self._result_history,
-            "n_ops": self._n_ops,
-            "w_needed": self._w_needed,
-            "max_losses": self._max_losses,
-            "base_balance": self._base_balance,
-            "payout_mult": self._payout_mult,
-        }
-
-    def restore_state(
-        self,
-        wins: int,
-        losses: int,
-        session_blocked: bool,
-        result_history: list[str] | None = None,
-        notify: bool = True,
-    ) -> None:
-        """Restaura estado desde persistencia."""
-        self._wins = max(0, int(wins))
-        self._losses = max(0, int(losses))
-        self._session_blocked = bool(session_blocked)
-        history = result_history or []
-        self._result_history = [str(item) for item in history if str(item) in {"W", "L"}][-200:]
-        if notify:
-            self._notify_state_change("restore_state")
-
-    def reset_session(self, reason: str = "manual_reset", notify: bool = True) -> None:
-        """Resetea estado de sesion (conteo e historial)."""
-        self._wins = 0
-        self._losses = 0
-        self._session_blocked = False
-        self._result_history = []
-        if notify:
-            self._notify_state_change(f"reset:{reason}")
-
-    def _notify_state_change(self, reason: str) -> None:
-        if self._state_change_callback is None:
-            return
-        try:
-            self._state_change_callback(self, reason)
-        except Exception:
-            logging.exception("MasanielloSession callback fallo (reason=%s)", reason)
-
-    def record_win(self) -> None:
-        """Registra una victoria de señal (WD, G1 o G2). Reinicia sesion si completa."""
-        self._wins += 1
-        self._session_blocked = False  # un win desbloquea la sesion
-        self._result_history.append("W")
-        self._result_history = self._result_history[-200:]
-        if self.is_session_over:
-            logging.info(
-                "MasanielloSession: sesion COMPLETADA (wins=%d). Reiniciando.",
-                self._wins,
-            )
-            self._wins = 0
-            self._losses = 0
-            self._session_blocked = False
-            self._result_history = []
-            self._notify_state_change("record_win_session_over_reset")
-            return
-        self._notify_state_change("record_win")
-
-    def record_loss(self) -> None:
-        """Registra una perdida de señal completa (L). Reinicia sesion si agotada.
-
-        MAX_SESSION_LOSSES guard: si se alcanzan _max_losses perdidas en la sesion,
-        la sesion se marca como bloqueada y se reinicia. Esto limita la exposicion
-        maxima por sesion sin afectar timing ni pipeline de ejecucion.
-        """
-        self._losses += 1
-        self._result_history.append("L")
-        self._result_history = self._result_history[-200:]
-        if self._losses >= self._max_losses:
-            logging.warning(
-                "MasanielloSession: LOSS GUARD activado (losses=%d >= max=%d). "
-                "Sesion bloqueada y reiniciada.",
-                self._losses,
-                self._max_losses,
-            )
-            self._session_blocked = True
-            self._wins = 0
-            self._losses = 0
-            self._result_history = []
-            self._notify_state_change("record_loss_guard_reset")
-            return
-        if self.is_session_over:
-            logging.info(
-                "MasanielloSession: sesion AGOTADA (losses=%d). Reiniciando.",
-                self._losses,
-            )
-            self._wins = 0
-            self._losses = 0
-            self._session_blocked = False
-            self._result_history = []
-            self._notify_state_change("record_loss_session_over_reset")
-            return
-        self._notify_state_change("record_loss")
-
-    def update_base(self, new_base: float) -> None:
-        """Actualiza la base de sizing Masaniello (llamado por EquityBandManager)."""
-        new_base = max(1.0, new_base)
-        if new_base != self._base_balance:
-            logging.info(
-                "MasanielloSession base actualizada: %.2f → %.2f",
-                self._base_balance,
-                new_base,
-            )
-            self._base_balance = new_base
-    def _masaniello_stake(self, balance: float, losses_so_far: int, wins_so_far: int) -> float:
-        n = self._n_ops
-        w = self._w_needed
-        pm = self._payout_mult
-
-        ops_left = n - (losses_so_far + wins_so_far)
-        wins_left = w - wins_so_far
-
-        if ops_left <= 0 or wins_left <= 0 or wins_left > ops_left:
-            return 0.01
-
-        p_win_fwd = self._forward_prob(ops_left - 1, wins_left - 1, pm)
-        p_lose_fwd = self._forward_prob(ops_left - 1, wins_left, pm)
-
-        denom = p_win_fwd + (pm - 1) * p_lose_fwd
-        if denom == 0:
-            return balance
-
-        stake = balance * (1 - pm * p_win_fwd / denom)
-        return round(max(0.01, min(stake, balance)), 2)
-
-    @staticmethod
-    def _forward_prob(ops_left: int, wins_needed: int, payout_mult: float) -> float:
-        if wins_needed <= 0:
-            return 1.0
-        if wins_needed > ops_left:
-            return 0.0
-        if wins_needed == ops_left:
-            return payout_mult ** ops_left
-        p_win = MasanielloSessionState._forward_prob(ops_left - 1, wins_needed - 1, payout_mult)
-        p_lose = MasanielloSessionState._forward_prob(ops_left - 1, wins_needed, payout_mult)
-        denom = p_win + (payout_mult - 1) * p_lose
-        if denom == 0:
-            return 0.0
-        return payout_mult * p_win * p_lose / denom
 
 
 class GlobalGaleState:

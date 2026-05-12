@@ -65950,3 +65950,136 @@ EUR/RUB OTC - 11:45 -> PÉRDIDA ❌
 21 VICTORIAS ✅
 03 PÉRDIDAS ❌
 
+[12/05/2026 16:15:14] VIP TRADER A: VICTORIA EN 1ª MARTINGALA ✅🤑
+
+[12/05/2026 16:17:20] VIP TRADER A: 💵 USD/JPY OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 16:20
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 16:25
+2️⃣ MARTINGALA A LAS 16:30
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[12/05/2026 16:25:13] VIP TRADER A: VICTORIA DIRECTA ✅🤑
+
+[12/05/2026 16:27:17] VIP TRADER A: 💵 GBP/USD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 16:30
+🔴 ABAJO
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 16:35
+2️⃣ MARTINGALA A LAS 16:40
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[12/05/2026 16:45:15] VIP TRADER A: ❌ PÉRDIDA
+
+[12/05/2026 16:46:29] VIP TRADER A: 💵 EUR/USD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 16:50
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 16:55
+2️⃣ MARTINGALA A LAS 17:00
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[12/05/2026 16:55:13] VIP TRADER A: VICTORIA DIRECTA ✅🤑
+
+[12/05/2026 16:57:12] VIP TRADER A: 💵 AUD/CHF OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 17:00
+🔴 ABAJO
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 17:05
+2️⃣ MARTINGALA A LAS 17:10
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[12/05/2026 17:15:15] VIP TRADER A: ❌ PÉRDIDA
+
+[12/05/2026 17:16:21] VIP TRADER A: 💵 EUR/NZD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 17:20
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 17:25
+2️⃣ MARTINGALA A LAS 17:30
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[12/05/2026 17:35:15] VIP TRADER A: ❌ PÉRDIDA
+
+[12/05/2026 17:35:53] VIP TRADER A: INFORME DE OPERACIONES (12/05)📊
+
+AUD/USD OTC - 00:05 -> VICTORIA ✅
+USD/CAD OTC - 00:25 -> VICTORIA ✅
+EUR/USD OTC - 00:35 -> VICTORIA ✅
+AUD/NZD OTC - 00:55 -> VICTORIA ✅
+AUD/CAD OTC - 01:05 -> VICTORIA ✅
+EUR/GBP OTC - 01:20 -> VICTORIA ✅
+AUD/USD OTC - 02:35 -> VICTORIA ✅
+NZD/USD OTC - 02:50 -> PÉRDIDA ❌
+USD/CAD OTC - 03:10 -> VICTORIA ✅
+GBP/USD OTC - 03:30 -> VICTORIA ✅
+USD/JPY OTC - 03:40 -> VICTORIA ✅
+AUD/NZD OTC - 03:50 -> VICTORIA ✅
+USD/CAD OTC - 05:35 -> VICTORIA ✅
+AUD/USD OTC - 05:45 -> VICTORIA ✅
+EUR/USD OTC - 06:00 -> PÉRDIDA ❌
+USD/CHF OTC - 06:20 -> VICTORIA ✅
+USD/JPY OTC - 06:30 -> VICTORIA ✅
+GBP/USD OTC - 06:40 -> VICTORIA ✅
+GBP/USD OTC - 10:35 -> VICTORIA ✅
+NZD/USD OTC - 10:45 -> VICTORIA ✅
+EUR/USD OTC - 11:05 -> VICTORIA ✅
+AUD/USD OTC - 11:15 -> VICTORIA ✅
+USD/JPY OTC - 11:25 -> VICTORIA ✅
+EUR/RUB OTC - 11:45 -> PÉRDIDA ❌
+USD/CAD OTC - 16:05 -> VICTORIA ✅
+USD/JPY OTC - 16:20 -> VICTORIA ✅
+GBP/USD OTC - 16:30 -> PÉRDIDA ❌
+EUR/USD OTC - 16:50 -> VICTORIA ✅
+AUD/CHF OTC - 17:00 -> PÉRDIDA ❌
+EUR/NZD OTC - 17:20 -> PÉRDIDA ❌
+
+24 VICTORIAS ✅
+06 PÉRDIDAS ❌
+
+[12/05/2026 18:45:00] SMART SIGNALS: ⏰ Configura tus alarmas 🚨
+🌍 LA SESIÓN COMIENZA A LAS 19:00 (UTC -3)
+
+🚨 ZONAS HORARIAS POR PAÍS ⬇️
+
+🇻🇪 Comienza a las 18:00 – Venezuela (UTC-4)
+🇦🇷 Comienza a las 19:00 – Argentina (UTC-3)
+🇬🇹 Comienza a las 16:00 – Guatemala (UTC-6)
+🇨🇴 Comienza a las 17:00 – Colombia (UTC-5)
+🇧🇴 Comienza a las 18:00 – Bolivia (UTC-4)
+🇵🇦 Comienza a las 17:00 – Panamá (UTC-5)
+🇩🇴 Comienza a las 18:00 – República Dominicana (UTC-4)
+🇲🇽 Comienza a las 16:00 – México (UTC-6)
+🇨🇱 Comienza a las 19:00 – Chile (UTC-3)
+🇪🇨 Comienza a las 17:00 – Ecuador (UTC-5)
+🇪🇸 Comienza a las 23:00 – España (UTC+1)
+
+📌 Enviaremos 6 señales de ALTA CALIDAD!
+📣 Mantente atento y prepárate! 🚀
+

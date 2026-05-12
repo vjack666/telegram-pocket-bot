@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from src.core.pipeline import MasanielloSessionState
+from src.core.pipeline_masaniello import MasanielloSessionState
 
 
 class MasanielloSessionPersistence:
@@ -42,6 +42,7 @@ class MasanielloSessionPersistence:
             return {"loaded": False, "reason": "daily_target_reached"}
 
         if saved_date != today:
+            session.reset_daily_counters(notify=False)
             session.reset_session(reason="new_utc_day", notify=False)
             self.save_session(session, reason="new_utc_day")
             return {"loaded": False, "reason": "different_date", "saved_date": saved_date, "today": today}
@@ -52,6 +53,11 @@ class MasanielloSessionPersistence:
             losses=state.get("losses", 0),
             session_blocked=state.get("is_session_blocked", False),
             result_history=state.get("result_history", []),
+            base_balance=state.get("base_balance"),
+            payout_mult=state.get("payout_mult"),
+            blocks_won_today=state.get("blocks_won_today", 0),
+            blocks_lost_today=state.get("blocks_lost_today", 0),
+            global_stop=state.get("global_stop", False),
             notify=False,
         )
         return {

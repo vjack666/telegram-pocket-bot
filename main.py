@@ -20,13 +20,14 @@ from dotenv import load_dotenv
 from src.config.settings import AppSettings
 from src.core.engine import SignalEngine
 from src.core.models import TradingSignal
-from src.core.masaniello_manager import MasanielloManager
-from src.core.pipeline import MessageQueue, SignalProcessor, StateManager, GlobalGaleState, MasanielloSessionState, RecoveryProfile
+from src.core.pipeline import MessageQueue, SignalProcessor, StateManager, GlobalGaleState
+from src.core.recovery_profile import RecoveryProfile
+from src.core.session_manager import SessionManager
 from src.core.equity_bands import EquityBandManager
 from src.core.daily_profit_tracker import DailyProfitTracker
 from src.core.manual_operation_tracker import ManualOperationTracker
 from src.core.manual_operation_cli import ManualOperationCLI
-from src.core.masaniello_session_persistence import MasanielloSessionPersistence
+from src.core.session_state_persistence import SessionStatePersistence
 from src.pocket_option.client import PocketOptionDemoClient
 from src.utils.blackbox import DeferredBlackBoxRecorder, ShutdownSnapshot
 from src.utils.session_learning_db import SessionLearningDB
@@ -250,32 +251,34 @@ async def run() -> None:
         _set_run_phase("running")
         logging.info("Navegador Pocket Option abierto. Resuelve CAPTCHA/login en esa ventana si aparece.")
 
-        # Ajustar el saldo inicial para cumplir con la meta de $2 adicionales o redondear a número par
+        # Saldo inicial real del broker para inicializar el perfil de riesgo.
         initial_balance = await pocket_client.get_account_balance()
-        adjusted_balance = round(initial_balance)
-        if adjusted_balance % 2 != 0:
-            adjusted_balance += 1  # Asegurar que sea par
-
-        logging.info("Ajustando el saldo inicial: actual=%.2f ajustado=%.2f", initial_balance, adjusted_balance)
-
-        # Calcular el monto necesario para alcanzar el próximo número par (+2 desde base ajustada).
-        # El broker requiere mínimo $1. Fórmula: bet = needed_gain / payout_decimal
-        # Ejemplo: saldo=125.01 → ajustado=126 → target=128 → needed=2.99 → bet=2.99/0.92=3.25
-        _payout_decimal = max(0.01, settings.calc_payout_percent / 100.0)
-        target_balance = adjusted_balance + 2
-        needed = max(0.0, target_balance - initial_balance)
-        next_amount = needed / _payout_decimal if needed > 0 else 0.0
-        next_amount = round(next_amount, 2)
-        # Respetar mínimo del broker ($1). Si needed=0 (ya está en número par), no se necesita ajuste.
-        if 0 < next_amount < 1.0:
-            next_amount = 1.0
-            logging.info("[Startup] Monto ajustado al mínimo del broker: $1.00")
-
-        logging.info(
-            "Monto inicial calculado para cumplir meta: $%.2f (saldo=%.2f → target par=%.2f)",
-            next_amount, initial_balance, target_balance,
-        )
-        # _next_entry_override se aplicará después de inicializar engine
+        runtime_payout_percent = float(settings.calc_payout_percent)
+        try:
+            selected_asset = await pocket_client.get_selected_asset()
+        except Exception:
+            selected_asset = settings.default_asset
+        try:
+            dynamic_payout = await pocket_client.get_current_payout_percent(selected_asset)
+            if dynamic_payout is not None:
+                runtime_payout_percent = float(dynamic_payout)
+                logging.info(
+                    "[Startup] Payout dinámico detectado: %.2f%% (asset=%s)",
+                    runtime_payout_percent,
+                    selected_asset or settings.default_asset,
+                )
+            else:
+                logging.info(
+                    "[Startup] Payout dinámico no disponible; usando fallback config: %.2f%%",
+                    runtime_payout_percent,
+                )
+        except Exception as _payout_exc:
+            logging.info(
+                "[Startup] No se pudo leer payout dinámico (%s); usando fallback config: %.2f%%",
+                _payout_exc,
+                runtime_payout_percent,
+            )
+        logging.info("Saldo inicial real detectado: %.2f", initial_balance)
 
         balance = await _wait_for_demo_balance(
             pocket_client, timeout_seconds=settings.pocket_balance_wait_seconds
@@ -295,7 +298,7 @@ async def run() -> None:
                 bands=settings.equity_bands,
                 upgrade_sessions_required=settings.equity_band_upgrade_sessions,
                 daily_target_pct=settings.equity_daily_target_pct,
-                initial_balance=adjusted_balance,
+                initial_balance=initial_balance,
                 state_path=settings.equity_state_path if settings.equity_state_persist else None,
                 deposit_guard_enabled=settings.equity_deposit_guard_enabled,
                 deposit_guard_jump_pct=settings.equity_deposit_jump_pct,
@@ -324,7 +327,8 @@ async def run() -> None:
         else:
             logging.info(
                 "[EquityBands] DESACTIVADO (APP_EQUITY_BANDS_ENABLED=false). "
-                "Usando base fija: %.2f",
+                "Techo de riesgo (APP_CALC_BASE_BALANCE): %.2f "
+                "[stake proviene del SessionManager, no de este valor]",
                 settings.calc_base_balance,
             )
 
@@ -370,94 +374,79 @@ async def run() -> None:
         _blackbox.record("telegram_pipeline_init", component="main")
         state_manager = StateManager(dedupe_ttl_seconds=settings.message_dedupe_ttl_seconds)
         global_gale_state = GlobalGaleState(profit_target=2.0)
-        # Si equity bands está activo, la base de Masaniello arranca desde la base operativa
-        _initial_masaniello_base = (
-            equity_manager.operational_base
-            if equity_manager is not None
-            else settings.masaniello_base_balance
+        # Filtro de payout mínimo para sesión automática.
+        if runtime_payout_percent < 82.0:
+            logging.error("[SECURITY] Payout %.2f%% menor al mínimo permitido (82%%). Sesión bloqueada.", runtime_payout_percent)
+            print("[SECURITY] Payout demasiado bajo. No se puede operar la estrategia de sesión.")
+            return
+
+        session_manager = SessionManager(
+            max_messages_per_session=6,
+            target_profit_session=10.0,
+            target_profit_per_win=5.0,
+            stop_loss_count=3,
+            payout=runtime_payout_percent / 100.0,
         )
-        masaniello_session = MasanielloSessionState(
-            n_ops=settings.masaniello_n_ops,
-            w_needed=settings.masaniello_w_needed,
-            base_balance=_initial_masaniello_base,
-            payout_mult=settings.calc_payout_percent / 100.0 + 1.0,
-            max_losses=settings.masaniello_max_session_losses,
-        )
-        masaniello_state_path = _RUNTIME_BASE_DIR / "masaniello" / "session_state.json"
-        masaniello_persistence = MasanielloSessionPersistence(str(masaniello_state_path))
-        should_reset_by_daily_target = bool(
-            daily_profit_tracker is not None and daily_profit_tracker.meta_reached
-        )
-        load_info = masaniello_persistence.load_into_session(
-            masaniello_session,
-            reset_if_daily_target_reached=should_reset_by_daily_target,
-        )
-        masaniello_save_task: asyncio.Task | None = None
+
+        session_state_path = _RUNTIME_BASE_DIR / "session_state.json"
+        session_persistence = SessionStatePersistence(str(session_state_path))
+        load_info = session_persistence.load_into_session(session_manager)
+        session_save_task: asyncio.Task | None = None
         pending_reason: str | None = None
 
-        def _schedule_masaniello_save(session: MasanielloSessionState, reason: str) -> None:
-            nonlocal masaniello_save_task, pending_reason
+        def _schedule_session_save(session: SessionManager, reason: str) -> None:
+            nonlocal session_save_task, pending_reason
             pending_reason = reason
 
-            if masaniello_save_task is not None and not masaniello_save_task.done():
+            if session_save_task is not None and not session_save_task.done():
                 return
 
             async def _drain_saves() -> None:
-                nonlocal masaniello_save_task, pending_reason
+                nonlocal session_save_task, pending_reason
                 try:
                     while pending_reason is not None:
                         current_reason = pending_reason
                         pending_reason = None
                         snapshot = session.to_dict()
                         await asyncio.to_thread(
-                            masaniello_persistence.save_snapshot,
+                            session_persistence.save_snapshot,
                             snapshot,
                             current_reason,
                         )
                 finally:
-                    masaniello_save_task = None
+                    session_save_task = None
 
             try:
                 loop = asyncio.get_running_loop()
-                masaniello_save_task = loop.create_task(_drain_saves(), name="masaniello_state_save")
+                session_save_task = loop.create_task(_drain_saves(), name="session_state_save")
             except RuntimeError:
                 # Fallback defensivo fuera de loop asyncio.
-                masaniello_persistence.save_session(session, reason)
+                session_persistence.save_session(session, reason)
 
-        masaniello_session.set_state_change_callback(_schedule_masaniello_save)
+        session_manager.set_state_change_callback(_schedule_session_save)
         # Garantiza archivo actualizado en arranque incluso cuando no haya cambios inmediatos.
-        masaniello_persistence.save_session(masaniello_session, reason="startup_sync")
+        session_persistence.save_session(session_manager, reason="startup_sync")
         logging.info(
-            "[MasanielloPersist] %s | path=%s | wins=%d losses=%d consumed=%d blocked=%s",
+            "[SessionPersist] %s | path=%s | wins=%d losses=%d mensajes=%d",
             "estado restaurado" if load_info.get("loaded") else f"estado reiniciado ({load_info.get('reason')})",
-            masaniello_state_path,
-            masaniello_session.wins,
-            masaniello_session.losses,
-            masaniello_session.signals_consumed,
-            masaniello_session.is_session_blocked,
+            session_state_path,
+            session_manager.wins,
+            session_manager.losses,
+            session_manager.signals_consumed,
         )
         _blackbox.record(
-            "masaniello_session_loaded",
-            component="masaniello_persistence",
+            "session_manager_loaded",
+            component="session_persistence",
             loaded=bool(load_info.get("loaded")),
             reason=str(load_info.get("reason", "unknown")),
-            wins=masaniello_session.wins,
-            losses=masaniello_session.losses,
-            signals_consumed=masaniello_session.signals_consumed,
-            blocked=masaniello_session.is_session_blocked,
-            path=str(masaniello_state_path),
-        )
-        # Caja negra de stake: no toca scheduling/async; solo entrega el siguiente monto.
-        masaniello_manager = MasanielloManager(
-            session_base_capital=settings.masaniello_manager_session_base,
-            ops_total=settings.masaniello_manager_ops_total,
-            wins_needed=settings.masaniello_manager_wins_needed,
-            max_gale_multiplier=settings.masaniello_manager_max_gale_mult,
-            payout=settings.calc_payout_percent / 100.0,
+            wins=session_manager.wins,
+            losses=session_manager.losses,
+            signals_consumed=session_manager.signals_consumed,
+            path=str(session_state_path),
         )
         # RecoveryProfile: g1/g2 desde .env; si vacios, calculo automatico desde payout.
         # Congelado al inicio — NO se recalcula en tiempo real.
-        _payout_net = settings.calc_payout_percent / 100.0
+        _payout_net = runtime_payout_percent / 100.0
         _auto_g1 = round((1.0 + _payout_net) / _payout_net, 4)
         _auto_g2 = round(_auto_g1 * _auto_g1, 4)
         recovery_profile = RecoveryProfile(
@@ -477,7 +466,7 @@ async def run() -> None:
             recovery_profile.max_total_exposure_pct * 100,
             ".env" if settings.recovery_g1_mult > 0.0 else "auto-payout",
         )
-        # La base inicial del calculator: equity_manager la gestiona si está activo
+        # Base inicial auxiliar para risk profile.
         _initial_calc_base = (
             equity_manager.operational_base
             if equity_manager is not None
@@ -515,7 +504,7 @@ async def run() -> None:
         if settings.manual_operations_enabled:
             manual_operation_tracker = ManualOperationTracker(
                 global_gale_state=global_gale_state,
-                masaniello_session=masaniello_session,
+                session_manager=session_manager,
             )
             logging.info(
                 "[ManualOperations] ACTIVO | Sistema de registro de operaciones manuales habilitado"
@@ -533,7 +522,7 @@ async def run() -> None:
             pocket_client=pocket_client,
             martingale_amounts=settings.martingale_amounts,
             martingale_mode=settings.martingale_mode,
-            calc_payout_percent=settings.calc_payout_percent,
+            calc_payout_percent=runtime_payout_percent,
             calc_increment=settings.calc_increment,
             calc_rule10_balance_threshold=settings.calc_rule10_balance_threshold,
             calc_max_steps=settings.calc_max_steps,
@@ -542,22 +531,24 @@ async def run() -> None:
             color_output=settings.color_output,
             signal_late_tolerance_seconds=settings.signal_late_tolerance_seconds,
             global_gale_state=global_gale_state,
-            masaniello_session=masaniello_session,
-            masaniello_manager=masaniello_manager,
+            session_manager=session_manager,
             recovery_profile=recovery_profile,
             calc_base_balance=_initial_calc_base,
             event_recorder=_blackbox.record,
             equity_manager=equity_manager,
             daily_profit_tracker=daily_profit_tracker,
             manual_operation_tracker=manual_operation_tracker,
+            pocket_min_order_amount=settings.pocket_min_order_amount,
+            masaniello_loss_brake_enabled=settings.masaniello_loss_brake_enabled,
+            masaniello_loss_brake_window_minutes=settings.masaniello_loss_brake_window_minutes,
+            masaniello_loss_brake_step=settings.masaniello_loss_brake_step,
+            masaniello_loss_brake_floor=settings.masaniello_loss_brake_floor,
         )
-        # Aplicar next_entry_override calculado al inicio
-        engine._next_entry_override = next_amount
-        logging.info("[Engine] next_entry_override inicial aplicado: %.2f", next_amount)
-
-        # ── Escribir monto inicial en la caja amount del broker ──────────────
-        # El monto prioritario es el de Masaniello si está activo; si no, el calculado.
-        _startup_amount = engine._next_entry_override if engine._next_entry_override else next_amount
+        # ── Escribir monto inicial sugerido por SessionManager en el broker ──
+        _startup_amount = round(
+            max(settings.pocket_min_order_amount, session_manager.current_entry_stake()),
+            2,
+        )
         if _startup_amount and _startup_amount > 0:
             try:
                 await pocket_client.set_amount(_startup_amount, max_retries=3)
@@ -586,7 +577,7 @@ async def run() -> None:
 
         # ── Monitor automático de operaciones manuales (sin API) ─────────────
         # Detecta cambios de saldo por operaciones manuales del usuario,
-        # actualiza Masaniello y escribe el siguiente monto en el broker.
+        # actualiza la sesión y escribe el siguiente monto en el broker.
         _balance_monitor_task = asyncio.create_task(
             engine.start_balance_monitor(poll_interval=2.5, min_change=0.5),
             name="balance_monitor",
@@ -656,20 +647,30 @@ async def run() -> None:
                 )
         except Exception as exc:
             exc_message = str(exc)
+            lowered_exc_message = exc_message.lower()
             is_telegram_source_config_error = (
                 isinstance(exc, RuntimeError)
                 and "No se pudo resolver ningun chat origen de Telegram" in exc_message
             )
-            if is_telegram_source_config_error:
+            is_telegram_auth_config_error = (
+                isinstance(exc, RuntimeError)
+                and "sesion telegram no autorizada" in lowered_exc_message
+            )
+            if is_telegram_source_config_error or is_telegram_auth_config_error:
                 _set_shutdown_reason(
                     "config_error",
                     "telegram_reader",
                     last_exception=f"{type(exc).__name__}: {exc}",
                 )
-                logging.error(
-                    "Configuracion Telegram invalida: TELEGRAM_SOURCE_CHATS contiene un chat no resoluble. "
-                    "Corrige @usuario/link/id y reinicia."
-                )
+                if is_telegram_source_config_error:
+                    logging.error(
+                        "Configuracion Telegram invalida: TELEGRAM_SOURCE_CHATS contiene un chat no resoluble. "
+                        "Corrige @usuario/link/id y reinicia."
+                    )
+                else:
+                    logging.error(
+                        "Sesion Telegram no autorizada. Reautentica TELEGRAM_SESSION_NAME y reinicia."
+                    )
             else:
                 _set_shutdown_reason(
                     "internal_error",

@@ -1,5 +1,10 @@
 # Modos de Martingala — Referencia técnica
 
+Estado actual:
+- Este documento describe modos legacy (fixed/calculator).
+- El flujo automático principal usa SessionManager (objetivo por sesión: 2 wins, stop loss 3 losses, máximo 6 mensajes).
+- Para configuración operativa vigente, ver CONFIGURATION.md.
+
 Configurado via `APP_MARTINGALE_MODE` en `.env`.
 
 ---

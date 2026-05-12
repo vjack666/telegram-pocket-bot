@@ -31,6 +31,7 @@ class AppSettings:
     pocket_profile_dir: str
     pocket_headless: bool
     pocket_execute_orders: bool
+    pocket_min_order_amount: float
     pocket_max_order_amount: float
     pocket_balance_selector: str
     pocket_asset_open_selector: str
@@ -59,10 +60,14 @@ class AppSettings:
     masaniello_w_needed: int
     masaniello_base_balance: float
     masaniello_max_session_losses: int   # max perdidas antes de cortar sesion
+    masaniello_loss_brake_enabled: bool
+    masaniello_loss_brake_window_minutes: int
+    masaniello_loss_brake_step: float
+    masaniello_loss_brake_floor: float
     # ── Sizing global ──────────────────────────────────────────────────────
     max_trade_pct: float          # cap por operación: ej 0.10 = 10% de base
     max_total_exposure_pct: float # cap exposición total — placeholder RiskEngine
-    calc_base_balance: float      # balance fijo para calculator (base fija)
+    calc_base_balance: float      # techo/base operativa de riesgo (compatibilidad)
     recovery_g1_mult: float       # 0.0 = auto desde payout
     recovery_g2_mult: float       # 0.0 = auto desde payout
     # ── Capital operativo dinámico (equity bands) ──────────────────────────
@@ -80,11 +85,6 @@ class AppSettings:
     daily_profit_target: float                  # meta diaria en dinero ($60)
     daily_profit_defensive_mode: bool           # cambiar a defensive tras meta
     daily_profit_state_path: str                # ruta del json de estado diario
-    # ── MasanielloManager (caja negra de stake) ────────────────────────────
-    masaniello_manager_session_base: float      # capital por sesión (caja)
-    masaniello_manager_ops_total: int           # operaciones por sesión
-    masaniello_manager_wins_needed: int         # ITM necesarios para ganar sesión
-    masaniello_manager_max_gale_mult: int       # techo Macro-Gale (ej. 16 = x1..x16)
     # ── Modo Híbrido (Bot + Humano) ────────────────────────────────────────
     g2_human_approval: bool          # True = pausa en G2 y espera APROBAR/CANCELAR del usuario
     g2_approval_timeout_seconds: int # segundos para responder antes de cancelar automáticamente
@@ -145,8 +145,8 @@ class AppSettings:
                 os.getenv("APP_MARTINGALE_AMOUNTS", "2,4,10"),
                 fallback=[2.0, 4.0, 10.0],
             ),
-            martingale_mode=os.getenv("APP_MARTINGALE_MODE", "fixed").strip().lower(),
-            calc_payout_percent=float(os.getenv("APP_CALC_PAYOUT_PERCENT", "92")),
+            martingale_mode="session",
+            calc_payout_percent=float(os.getenv("APP_PAYOUT_DEFAULT", "92")),
             calc_increment=int(os.getenv("APP_CALC_INCREMENT", "2")),
             calc_rule10_balance_threshold=float(
                 os.getenv("APP_CALC_RULE10_BALANCE_THRESHOLD", "50")
@@ -164,6 +164,7 @@ class AppSettings:
             ),
             pocket_headless=_to_bool(os.getenv("POCKET_HEADLESS", "false")),
             pocket_execute_orders=_to_bool(os.getenv("POCKET_EXECUTE_ORDERS", "false")),
+            pocket_min_order_amount=float(os.getenv("POCKET_MIN_ORDER_AMOUNT", "1.0")),
             pocket_max_order_amount=float(os.getenv("POCKET_MAX_ORDER_AMOUNT", "5")),
             pocket_balance_selector=os.getenv("POCKET_BALANCE_SELECTOR", "").strip(),
             pocket_asset_open_selector=os.getenv("POCKET_ASSET_OPEN_SELECTOR", "").strip(),
@@ -193,10 +194,22 @@ class AppSettings:
             telegram_channel_names=_parse_channel_names(
                 os.getenv("TELEGRAM_CHANNEL_NAMES", "")
             ),
-            masaniello_n_ops=int(os.getenv("APP_MASANIELLO_N_OPS", "12")),
-            masaniello_w_needed=int(os.getenv("APP_MASANIELLO_W_NEEDED", "4")),
-            masaniello_base_balance=float(os.getenv("APP_MASANIELLO_BASE_BALANCE", "300")),
+            masaniello_n_ops=5,
+            masaniello_w_needed=2,
+            masaniello_base_balance=20.0,
             masaniello_max_session_losses=int(os.getenv("APP_MASANIELLO_MAX_SESSION_LOSSES", "3")),
+            masaniello_loss_brake_enabled=_to_bool(
+                os.getenv("APP_MASANIELLO_LOSS_BRAKE_ENABLED", "true")
+            ),
+            masaniello_loss_brake_window_minutes=int(
+                os.getenv("APP_MASANIELLO_LOSS_BRAKE_WINDOW_MINUTES", "180")
+            ),
+            masaniello_loss_brake_step=float(
+                os.getenv("APP_MASANIELLO_LOSS_BRAKE_STEP", "0.25")
+            ),
+            masaniello_loss_brake_floor=float(
+                os.getenv("APP_MASANIELLO_LOSS_BRAKE_FLOOR", "0.25")
+            ),
             max_trade_pct=float(os.getenv("APP_MAX_TRADE_PCT", "0.10")),
             max_total_exposure_pct=float(os.getenv("APP_MAX_TOTAL_EXPOSURE_PCT", "0.25")),
             calc_base_balance=float(os.getenv("APP_CALC_BASE_BALANCE", "300")),
@@ -241,18 +254,6 @@ class AppSettings:
                 "APP_DAILY_PROFIT_STATE_PATH",
                 "runtime/daily_profit_state.json",
             ).strip(),
-            masaniello_manager_session_base=float(
-                os.getenv("APP_MASANIELLO_MANAGER_SESSION_BASE", "10.0")
-            ),
-            masaniello_manager_ops_total=int(
-                os.getenv("APP_MASANIELLO_MANAGER_OPS_TOTAL", "6")
-            ),
-            masaniello_manager_wins_needed=int(
-                os.getenv("APP_MASANIELLO_MANAGER_WINS_NEEDED", "3")
-            ),
-            masaniello_manager_max_gale_mult=int(
-                os.getenv("APP_MASANIELLO_MANAGER_MAX_GALE_MULT", "16")
-            ),
             g2_human_approval=_to_bool(os.getenv("APP_G2_HUMAN_APPROVAL", "false")),
             g2_approval_timeout_seconds=int(os.getenv("APP_G2_APPROVAL_TIMEOUT_SECONDS", "20")),
             session_learning_db_path=os.getenv(

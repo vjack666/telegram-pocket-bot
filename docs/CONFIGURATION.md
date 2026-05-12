@@ -49,18 +49,20 @@ Usa `.env.example` como plantilla base.
 
 ---
 
-## Martingala
+## Session Objective (modo automatico)
 
-| Variable                            | Tipo      | Defecto    | Descripción |
-|-------------------------------------|-----------|------------|-------------|
-| `APP_MARTINGALE_AMOUNTS`            | CSV float | `2,4,10`   | Montos para cada paso de la secuencia (modo `fixed`) |
-| `APP_MARTINGALE_MODE`               | str       | `fixed`    | Modo de cálculo: `fixed` o `calculator` |
-| `APP_CALC_PAYOUT_PERCENT`           | float     | `92`       | Payout esperado de Pocket Option en % (para modo `calculator`) |
-| `APP_CALC_INCREMENT`                | int       | `2`        | Incremento de unidades por paso (modo `calculator`) |
-| `APP_CALC_RULE10_BALANCE_THRESHOLD` | float     | `50`       | Balance umbral para activar Regla 10 en `calculator` |
-| `APP_CALC_MAX_STEPS`                | int       | `3`        | Máximo de pasos de martingala permitidos |
+| Variable                                  | Tipo      | Defecto    | Descripción |
+|-------------------------------------------|-----------|------------|-------------|
+| `APP_PAYOUT_DEFAULT`                      | float     | `92`       | Payout fallback (%) cuando no se puede leer payout dinámico del broker |
+| `POCKET_MIN_ORDER_AMOUNT`                 | float     | `1.0`      | Monto mínimo permitido para escribir en la UI del broker |
+| `APP_MASANIELLO_LOSS_BRAKE_ENABLED`       | bool      | `true`     | Activa freno progresivo por pérdidas recientes |
+| `APP_MASANIELLO_LOSS_BRAKE_WINDOW_MINUTES`| int       | `180`      | Ventana temporal para contar pérdidas recientes |
+| `APP_MASANIELLO_LOSS_BRAKE_STEP`          | float     | `0.25`     | Reducción del stake por cada pérdida dentro de la ventana |
+| `APP_MASANIELLO_LOSS_BRAKE_FLOOR`         | float     | `0.25`     | Piso mínimo del multiplicador de freno |
 
-Ver [MARTINGALE_MODES.md](MARTINGALE_MODES.md) para descripción completa de cada modo.
+Notas:
+- El modo automático actual usa SessionManager con objetivo por sesión (2 wins o 3 losses, máximo 6 mensajes).
+- `APP_MARTINGALE_MODE` y variables de `calculator` quedan como compatibilidad legacy, no como estrategia automática principal.
 
 ---
 
@@ -84,6 +86,7 @@ Ver [MARTINGALE_MODES.md](MARTINGALE_MODES.md) para descripción completa de cad
 | `POCKET_HEADLESS`               | bool   | `false`                                                     | Correr el browser sin ventana visible. Se recomienda `false` para resolver CAPTCHA. |
 | `POCKET_EXECUTE_ORDERS`         | bool   | `false`                                                     | Si `true`, ejecuta clicks reales en el browser para colocar órdenes |
 | `POCKET_MAX_ORDER_AMOUNT`       | float  | `5`                                                         | Límite máximo de monto por orden (seguridad) |
+| `POCKET_MIN_ORDER_AMOUNT`       | float  | `1.0`                                                       | Monto mínimo para seteo de orden en la UI |
 | `POCKET_BALANCE_WAIT_SECONDS`   | int    | `240`                                                       | Segundos máximos para esperar que el balance cargue al iniciar |
 | `POCKET_KEEP_BROWSER_OPEN`      | bool   | `true`                                                      | Si `true`, el browser se mantiene abierto entre operaciones |
 

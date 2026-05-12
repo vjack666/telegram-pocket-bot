@@ -67,6 +67,9 @@ class PocketOptionBaseClient(ABC):
     async def get_selected_asset(self) -> str:
         return ""
 
+    async def get_current_payout_percent(self, asset: str | None = None) -> float | None:
+        return None
+
     async def get_configured_expiry_seconds(self) -> int | None:
         return None
 
@@ -510,6 +513,90 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
         return await self._run_with_browser_ui_lock(
             "get_configured_expiry_seconds",
             _do_get_expiry_seconds,
+        )
+
+    async def get_current_payout_percent(self, asset: str | None = None) -> float | None:
+        if self._page is None:
+            return None
+
+        target = canonicalize_pocket_asset(asset or self._last_selected_asset or self._default_asset)
+        target_key = _asset_symbol_key(target)
+
+        async def _do_get_current_payout_percent() -> float | None:
+            if self._page is None:
+                return None
+
+            texts = await self._page.evaluate(
+                r"""
+                () => {
+                    const selectors = [
+                        '.quotes-list .item',
+                        '.quotes-item',
+                        '.asset-item',
+                        '[class*="quotes"] [class*="item"]',
+                        '[class*="asset"] [class*="item"]',
+                        '#put-call-buttons-chart-1',
+                    ];
+
+                    const visible = (el) => {
+                        const st = window.getComputedStyle(el);
+                        const r = el.getBoundingClientRect();
+                        return st.visibility !== 'hidden' && st.display !== 'none' && r.width > 8 && r.height > 8;
+                    };
+
+                    const out = [];
+                    const seen = new Set();
+                    for (const sel of selectors) {
+                        for (const el of Array.from(document.querySelectorAll(sel))) {
+                            if (!visible(el)) continue;
+                            const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                            if (!txt || txt.length < 4 || txt.length > 320) continue;
+                            if (!txt.includes('%')) continue;
+                            if (seen.has(txt)) continue;
+                            seen.add(txt);
+                            out.push(txt);
+                            if (out.length >= 120) return out;
+                        }
+                    }
+                    return out;
+                }
+                """
+            )
+
+            if not texts:
+                return None
+
+            def _parse_percent_candidates(raw: str) -> list[float]:
+                values: list[float] = []
+                for token in re.findall(r"(\d{1,3}(?:[\.,]\d+)?)\s*%", raw):
+                    try:
+                        value = float(token.replace(",", "."))
+                    except Exception:
+                        continue
+                    if 1.0 <= value <= 100.0:
+                        values.append(value)
+                return values
+
+            best_for_asset: float | None = None
+            generic_best: float | None = None
+
+            for raw in texts:
+                percents = _parse_percent_candidates(raw)
+                if not percents:
+                    continue
+                row_best = max(percents)
+                generic_best = row_best if generic_best is None else max(generic_best, row_best)
+
+                if target_key:
+                    row_key = _asset_symbol_key(raw)
+                    if row_key and (target_key in row_key or row_key in target_key):
+                        best_for_asset = row_best if best_for_asset is None else max(best_for_asset, row_best)
+
+            return best_for_asset if best_for_asset is not None else generic_best
+
+        return await self._run_with_browser_ui_lock(
+            "get_current_payout_percent",
+            _do_get_current_payout_percent,
         )
 
     async def _run_with_browser_ui_lock(
