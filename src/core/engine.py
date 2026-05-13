@@ -58,10 +58,10 @@ class SignalEngine:
         operation_mode_sound_alert: bool = True,
         manual_operation_tracker: ManualOperationTracker | None = None,
         pocket_min_order_amount: float = 1.0,
-        masaniello_loss_brake_enabled: bool = True,
-        masaniello_loss_brake_window_minutes: int = 180,
-        masaniello_loss_brake_step: float = 0.25,
-        masaniello_loss_brake_floor: float = 0.25,
+        session_loss_brake_enabled: bool = True,
+        session_loss_brake_window_minutes: int = 180,
+        session_loss_brake_step: float = 0.25,
+        session_loss_brake_floor: float = 0.25,
     ) -> None:
         self._pocket_client = pocket_client
         self._martingale_amounts = [value for value in martingale_amounts if value > 0] or [2.0, 4.0, 10.0]
@@ -142,12 +142,12 @@ class SignalEngine:
         self._bot_trade_in_progress: bool = False
         self._pocket_min_order_amount = max(0.01, float(pocket_min_order_amount))
         # Freno automático por racha de pérdidas recientes (ventana deslizante)
-        self._masaniello_loss_brake_enabled = bool(masaniello_loss_brake_enabled)
-        self._masaniello_loss_brake_window = timedelta(
-            minutes=max(1, int(masaniello_loss_brake_window_minutes))
+        self._session_loss_brake_enabled = bool(session_loss_brake_enabled)
+        self._session_loss_brake_window = timedelta(
+            minutes=max(1, int(session_loss_brake_window_minutes))
         )
-        self._masaniello_loss_brake_step = max(0.0, float(masaniello_loss_brake_step))
-        self._masaniello_loss_brake_floor = max(0.05, min(1.0, float(masaniello_loss_brake_floor)))
+        self._session_loss_brake_step = max(0.0, float(session_loss_brake_step))
+        self._session_loss_brake_floor = max(0.05, min(1.0, float(session_loss_brake_floor)))
         self._recent_cycle_loss_times: list[datetime] = []
 
     async def start_balance_monitor(
@@ -159,7 +159,7 @@ class SignalEngine:
 
         Cada `poll_interval` segundos lee el saldo. Si detecta un cambio >= `min_change`
         que NO proviene de una operación del bot (flag _bot_trade_in_progress=False),
-        lo trata como operación manual: determina WIN/LOSS y actualiza Masaniello.
+        lo trata como operación manual: determina WIN/LOSS y actualiza sesión.
         No requiere API — usa Playwright igual que el resto del sistema.
         """
         logging.info(
@@ -371,7 +371,7 @@ class SignalEngine:
             clear_countdown_line()
 
     def _prune_recent_cycle_losses(self, now_utc: datetime) -> None:
-        cutoff = now_utc - self._masaniello_loss_brake_window
+        cutoff = now_utc - self._session_loss_brake_window
         self._recent_cycle_loss_times = [
             ts for ts in self._recent_cycle_loss_times if ts >= cutoff
         ]
@@ -383,14 +383,14 @@ class SignalEngine:
         self._prune_recent_cycle_losses(now_utc)
 
     def _loss_brake_multiplier(self, now_utc: datetime | None = None) -> float:
-        if not self._masaniello_loss_brake_enabled:
+        if not self._session_loss_brake_enabled:
             return 1.0
         if now_utc is None:
             now_utc = datetime.now(timezone.utc)
         self._prune_recent_cycle_losses(now_utc)
         losses_recent = len(self._recent_cycle_loss_times)
-        multiplier = 1.0 - (losses_recent * self._masaniello_loss_brake_step)
-        return max(self._masaniello_loss_brake_floor, min(1.0, multiplier))
+        multiplier = 1.0 - (losses_recent * self._session_loss_brake_step)
+        return max(self._session_loss_brake_floor, min(1.0, multiplier))
 
     def _apply_broker_amount_floor(self, amount: float) -> float:
         return round(max(self._pocket_min_order_amount, float(amount)), 2)
@@ -419,7 +419,11 @@ class SignalEngine:
         clear_countdown_line()
         logging.error(message)
         print(f"\n[ALERTA] {message}")
-        self._emit_event("session_stop_loss_triggered", message=message)
+        self._emit_event(
+            "session_stop_loss_triggered",
+            message=message,
+            blocks_lost_today=self._session_manager.blocks_lost_today if self._session_manager else None,
+        )
 
     def _update_session_after_result(self, step_name: str, won: bool) -> None:
         if self._session_manager is None:
@@ -430,6 +434,7 @@ class SignalEngine:
         status = self._session_manager.update_session_status(
             result_label,
             debt_after_loss=debt_after_loss,
+            current_balance=self._last_known_balance,
         )
         if status.get("stop_triggered"):
             self._alert_session_stop_loss()
@@ -534,9 +539,9 @@ class SignalEngine:
         Este método es el PUNTO CENTRAL donde una intervención manual se integra
         completamente en el estado global del bot. Actualiza:
         - GlobalGaleState (accumulated_loss, current_step, target_balance)
-        - MasanielloSession (wins/losses para conteo de sesión)
+        - SessionManager (wins/losses para conteo de sesión)
         - ManualOperationTracker (historial auditable)
-        - Masaniello Manager (próximo stake)
+        - Gestor de sesión (próximo stake)
         
         Args:
             result: "W" (WIN) o "L" (LOSS)
@@ -764,7 +769,7 @@ class SignalEngine:
         if self._session_learning_db is None:
             return
         seq = self._cycle_sequence or ""
-        label = self._masaniello_label_from_seq(seq)
+        label = self._session_label_from_seq(seq)
         step_reached = len(seq)
         won = seq.endswith("W") if seq else False
         # Calcular pnl del ciclo aproximado desde el global_gale
@@ -781,8 +786,8 @@ class SignalEngine:
         self._session_learning_db.record_session(
             asset=signal.asset,
             side=signal.side,
-            masaniello_sequence=seq,
-            masaniello_label=label,
+            session_sequence=seq,
+            session_label=label,
             step_reached=step_reached,
             g2_intervened=self._cycle_g2_intervened,
             g2_approved=self._cycle_g2_approved,
@@ -793,7 +798,7 @@ class SignalEngine:
         )
 
     @staticmethod
-    def _masaniello_label_from_seq(seq: str) -> str:
+    def _session_label_from_seq(seq: str) -> str:
         if not seq:
             return "M1 inicio"
         if seq == "W":
@@ -809,8 +814,7 @@ class SignalEngine:
     async def _apply_equity_update(self) -> None:
         """Lee el balance actual y notifica al EquityBandManager.
 
-        Si la banda cambia, sincroniza _calc_base_balance y la base de
-        MasanielloSessionState para que el próximo ciclo use el sizing correcto.
+        Si la banda cambia, sincroniza _calc_base_balance para el próximo ciclo.
         """
         if self._equity_manager is None:
             return
@@ -1209,7 +1213,7 @@ class SignalEngine:
         logging.info("%s cerro en LOSS. Continuando con %s.", current_step_name, next_step_name)
         self._cycle_sequence += "L"  # tracking de aprendizaje
         # Registrar LOSS en el estado global antes de continuar al siguiente paso
-        # Nota: NO se registra en MasanielloSession aqui — es un paso intermedio.
+        # Nota: NO se registra en SessionManager aquí — es un paso intermedio.
         # Solo se registra como LOSS de señal cuando es_last=True en _execute_step_chain.
         self._global_gale.record_loss(current_amount)
 
@@ -1737,6 +1741,11 @@ class SignalEngine:
             try:
                 value = await self._pocket_client.get_account_balance()
                 self._last_known_balance = value
+                if self._session_manager is not None and hasattr(self._session_manager, "observe_balance"):
+                    try:
+                        self._session_manager.observe_balance(value)
+                    except Exception:
+                        pass
                 return value
             except Exception as exc:
                 last_exc = exc
@@ -1925,16 +1934,38 @@ class SignalEngine:
     def _session_amounts(self) -> list[float]:
         """Calcula [entry, G1, G2] exclusivamente desde SessionManager."""
         assert self._session_manager is not None
-        entry = self._session_manager.get_next_stake(self._pocket_min_order_amount)
+
+        if hasattr(self._session_manager, "should_use_recovery_sequence") and self._session_manager.should_use_recovery_sequence():
+            flat = self._apply_broker_amount_floor(float(self._session_manager.recovery_stake))
+            amounts = [flat, flat, flat]
+            logging.info(
+                "Recuperacion activa: usando secuencia plana especial %s | "
+                "deuda=%.2f max_hist=%.2f balance=%.2f objetivo=%.2f",
+                amounts,
+                float(getattr(self._session_manager, "deuda_acumulada", 0.0)),
+                float(getattr(self._session_manager, "balance_maximo_historico", 0.0)),
+                float(getattr(self._session_manager, "balance_actual", 0.0)),
+                float(getattr(self._session_manager, "balance_objetivo_recuperacion", 0.0)),
+            )
+            return amounts
+
+        base_entry = self._session_manager.get_next_stake(self._pocket_min_order_amount)
+
+        g1_mult = max(1.0, float(self._recovery_profile.g1_mult))
+        g2_mult = max(g1_mult, float(self._recovery_profile.g2_mult))
+
+        entry = self._apply_broker_amount_floor(base_entry)
+        g1_amount = self._apply_broker_amount_floor(base_entry * g1_mult)
+        g2_amount = self._apply_broker_amount_floor(base_entry * g2_mult)
 
         amounts = [
             entry,
-            entry,
-            entry,
+            g1_amount,
+            g2_amount,
         ]
         logging.info(
             "Sesion %d/%d: señal %d/%d wins=%d losses=%d "
-            "entry=%.2f (source=SessionManager.get_next_stake) amounts=%s",
+            "base=%.2f g1_mult=%.4f g2_mult=%.4f amounts=%s",
             self._session_manager.n_ops,
             self._session_manager.w_needed,
             self._session_manager.signals_consumed + 1,
@@ -1942,6 +1973,8 @@ class SignalEngine:
             self._session_manager.wins,
             self._session_manager.losses,
             entry,
+            g1_mult,
+            g2_mult,
             amounts,
         )
         return amounts

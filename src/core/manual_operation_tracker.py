@@ -1,13 +1,13 @@
 """Manual Operation Tracker — Registra operaciones manuales del usuario.
 
 Permite al usuario registrar entradas manuales (buy/sell) que hace en la UI de Pocket Option
-cuando está en una pérdida de Masaniello y quiere intentar recuperación manual.
+cuando está en una pérdida de sesión y quiere intentar recuperación manual.
 
 Flujo:
-1. Bot está en LOSS del Masaniello (step 1, 2, ...)
+1. Bot está en LOSS de sesión (step 1, 2, ...)
 2. Usuario entra manualmente en Pocket Option con su criterio
 3. Usuario registra el resultado (WIN/LOSS) via CLI o archivo
-4. Sistema actualiza GlobalGaleState y continúa secuencia Masaniello
+4. Sistema actualiza GlobalGaleState y continúa secuencia de sesión
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from typing import Literal
 
 from src.core.pipeline import GlobalGaleState
 from src.core.session_manager import SessionManager
+from src.strategies import manual_strategies
 
 
 @dataclass
@@ -40,7 +41,7 @@ class ManualOperation:
 
 class ManualOperationTracker:
     """
-    Rastreador de operaciones manuales que impactan el estado de Masaniello.
+    Rastreador de operaciones manuales que impactan el estado de sesión.
     
     Responsabilidades:
     - Registrar entrada manual (asset, side, amount)
@@ -53,9 +54,11 @@ class ManualOperationTracker:
         self,
         global_gale_state: GlobalGaleState,
         session_manager: SessionManager | None = None,
+        manual_strategy: object | None = None,
     ) -> None:
         self._gale_state = global_gale_state
         self._session_manager = session_manager
+        self._manual_strategy = manual_strategy
         self._history: list[ManualOperation] = []
 
     def register_manual_operation(
@@ -70,7 +73,7 @@ class ManualOperationTracker:
         apply_state: bool = True,
     ) -> ManualOperation:
         """
-        Registra una operación manual y actualiza el estado de Masaniello.
+        Registra una operación manual y actualiza el estado de sesión.
         
         Args:
             asset: Ej "EURUSD OTC"
@@ -105,20 +108,25 @@ class ManualOperationTracker:
         if result == "WIN":
             logging.info(
                 "📊 Operación manual WIN registrada: %s %s $%.2f | "
-                "Reseteando Masaniello",
+                "Reseteando sesión",
                 side,
                 asset,
                 amount,
             )
             self._gale_state.record_win()
             if self._session_manager is not None:
-                self._session_manager.update_session_status("WIN")
+                self._session_manager.update_session_status(
+                    "WIN",
+                    current_balance=balance_after,
+                )
+            if self._manual_strategy is not None and hasattr(self._manual_strategy, "record_win"):
+                self._manual_strategy.record_win()
 
         elif result == "LOSS":
             loss_amount = balance_before - (balance_after or balance_before - amount)
             logging.info(
                 "📊 Operación manual LOSS registrada: %s %s $%.2f | "
-                "Pérdida: $%.2f | Continuando Masaniello",
+                "Pérdida: $%.2f | Continuando sesión",
                 side,
                 asset,
                 amount,
@@ -129,12 +137,15 @@ class ManualOperationTracker:
                 self._session_manager.update_session_status(
                     "LOSS",
                     debt_after_loss=self._gale_state.accumulated_loss,
+                    current_balance=balance_after,
                 )
+            if self._manual_strategy is not None and hasattr(self._manual_strategy, "record_loss"):
+                self._manual_strategy.record_loss(amount)
 
         else:
             logging.warning(
                 "📊 Operación manual UNKNOWN registrada: %s %s $%.2f | "
-                "No se actualiza Masaniello",
+                "No se actualiza sesión",
                 side,
                 asset,
                 amount,

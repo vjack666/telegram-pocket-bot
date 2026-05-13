@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 @dataclass(frozen=True)
 class AppSettings:
+    # Campos sin valores predeterminados (obligatorios)
     enable_telegram: bool
     telegram_api_id: Optional[int]
     telegram_api_hash: str
@@ -18,14 +19,12 @@ class AppSettings:
     telegram_realtime_only: bool
     telegram_restart_after_signal: bool
     single_asset_mode: bool
-    martingale_amounts: List[float]
     martingale_mode: str
     calc_payout_percent: float
     calc_increment: int
     calc_rule10_balance_threshold: float
     calc_max_steps: int
     order_result_grace_seconds: int
-    color_output: bool
     pocket_account_mode: str
     pocket_demo_url: str
     pocket_profile_dir: str
@@ -45,7 +44,6 @@ class AppSettings:
     default_amount: float
     default_asset: str
     override_asset: str
-    override_side: Optional[str]
     dry_run: bool
     log_level: str
     expected_utc_offset_hours: int
@@ -55,46 +53,50 @@ class AppSettings:
     processing_queue_maxsize: int
     message_dedupe_ttl_seconds: int
     busy_policy: str
-    telegram_channel_names: Dict[str, str]  # raw_chat -> display name
+    telegram_channel_names: Dict[str, str]
+    session_max_messages: int
+    session_target_profit: float
+    session_target_profit_per_win: float
+    session_stop_loss_count: int
     masaniello_n_ops: int
     masaniello_w_needed: int
     masaniello_base_balance: float
-    masaniello_max_session_losses: int   # max perdidas antes de cortar sesion
+    masaniello_max_session_losses: int
     masaniello_loss_brake_enabled: bool
     masaniello_loss_brake_window_minutes: int
     masaniello_loss_brake_step: float
     masaniello_loss_brake_floor: float
-    # ── Sizing global ──────────────────────────────────────────────────────
-    max_trade_pct: float          # cap por operación: ej 0.10 = 10% de base
-    max_total_exposure_pct: float # cap exposición total — placeholder RiskEngine
-    calc_base_balance: float      # techo/base operativa de riesgo (compatibilidad)
-    recovery_g1_mult: float       # 0.0 = auto desde payout
-    recovery_g2_mult: float       # 0.0 = auto desde payout
-    # ── Capital operativo dinámico (equity bands) ──────────────────────────
-    equity_bands_enabled: bool                  # activar sistema de bandas
-    equity_bands: List[Tuple[float, float]]     # [(min_balance, base), ...]
-    equity_band_upgrade_sessions: int           # sesiones antes de subir banda
-    equity_daily_target_pct: float              # meta diaria = base × pct
-    equity_state_persist: bool                  # persistir estado en disco
-    equity_state_path: str                      # ruta del json de estado
-    equity_deposit_guard_enabled: bool          # detectar +equity externo
-    equity_deposit_jump_pct: float              # salto relativo para depósito
-    equity_deposit_cooldown_sessions: int       # cooldown de upgrades
-    # ── Daily Profit Tracking ──────────────────────────────────────────────
-    daily_profit_tracking_enabled: bool         # activar tracking diario
-    daily_profit_target: float                  # meta diaria en dinero ($60)
-    daily_profit_defensive_mode: bool           # cambiar a defensive tras meta
-    daily_profit_state_path: str                # ruta del json de estado diario
-    # ── Modo Híbrido (Bot + Humano) ────────────────────────────────────────
-    g2_human_approval: bool          # True = pausa en G2 y espera APROBAR/CANCELAR del usuario
-    g2_approval_timeout_seconds: int # segundos para responder antes de cancelar automáticamente
-    session_learning_db_path: str    # ruta del JSONL de aprendizaje de sesiones
-    operation_mode_schedule_enabled: bool  # alterna HIBRIDO/AUTOMATICO por horario
-    operation_mode_hybrid_start_hour: int  # inicio HIBRIDO en hora de señales (UTC-3)
-    operation_mode_hybrid_end_hour: int    # fin HIBRIDO en hora de señales (UTC-3)
-    operation_mode_sound_alert: bool       # alerta sonora cuando cambia el modo
-    # ── Manual Operations ──────────────────────────────────────────────────
-    manual_operations_enabled: bool        # activar registro de operaciones manuales
+    max_trade_pct: float
+    max_total_exposure_pct: float
+    calc_base_balance: float
+    recovery_g1_mult: float
+    recovery_g2_mult: float
+    equity_bands_enabled: bool
+    equity_bands: List[Tuple[float, float]]
+    equity_band_upgrade_sessions: int
+    equity_daily_target_pct: float
+    equity_state_persist: bool
+    equity_state_path: str
+    equity_deposit_guard_enabled: bool
+    equity_deposit_jump_pct: float
+    equity_deposit_cooldown_sessions: int
+    daily_profit_tracking_enabled: bool
+    daily_profit_target: float
+    daily_profit_defensive_mode: bool
+    daily_profit_state_path: str
+    g2_human_approval: bool
+    g2_approval_timeout_seconds: int
+    session_learning_db_path: str
+    operation_mode_schedule_enabled: bool
+    operation_mode_hybrid_start_hour: int
+    operation_mode_hybrid_end_hour: int
+    operation_mode_sound_alert: bool
+
+    # Campos con valores predeterminados (opcionales)
+    martingale_amounts: List[float] = field(default_factory=lambda: [1.09, 2.27, 4.73])
+    color_output: bool = True
+    override_side: Optional[str] = None
+    manual_operations_enabled: bool = False
 
     @staticmethod
     def load() -> "AppSettings":
@@ -125,6 +127,24 @@ class AppSettings:
             if not source_chats:
                 raise ValueError("Falta TELEGRAM_SOURCE_CHATS en .env")
 
+        session_max_messages = int(
+            os.getenv("APP_SESSION_MAX_MESSAGES", os.getenv("APP_MASANIELLO_N_OPS", "6"))
+        )
+        session_target_profit = float(os.getenv("APP_SESSION_TARGET_PROFIT", "10.0"))
+        session_target_profit_per_win = float(os.getenv("APP_SESSION_TARGET_PROFIT_PER_WIN", "5.0"))
+        session_stop_loss_count = int(
+            os.getenv(
+                "APP_SESSION_STOP_LOSS_COUNT",
+                os.getenv("APP_MASANIELLO_MAX_SESSION_LOSSES", "3"),
+            )
+        )
+        legacy_w_needed = int(
+            os.getenv(
+                "APP_MASANIELLO_W_NEEDED",
+                str(max(1, int(session_target_profit / max(0.01, session_target_profit_per_win)))),
+            )
+        )
+
         return AppSettings(
             enable_telegram=enable_telegram,
             telegram_api_id=int(api_id_raw) if api_id_raw else None,
@@ -142,8 +162,8 @@ class AppSettings:
             ),
             single_asset_mode=_to_bool(os.getenv("APP_SINGLE_ASSET_MODE", "false")),
             martingale_amounts=_csv_float_list(
-                os.getenv("APP_MARTINGALE_AMOUNTS", "2,4,10"),
-                fallback=[2.0, 4.0, 10.0],
+                os.getenv("APP_MARTINGALE_AMOUNTS", "1.09,2.27,4.73"),  # Updated default amounts
+                fallback=[1.09, 2.27, 4.73],
             ),
             martingale_mode="session",
             calc_payout_percent=float(os.getenv("APP_PAYOUT_DEFAULT", "92")),
@@ -194,10 +214,14 @@ class AppSettings:
             telegram_channel_names=_parse_channel_names(
                 os.getenv("TELEGRAM_CHANNEL_NAMES", "")
             ),
-            masaniello_n_ops=5,
-            masaniello_w_needed=2,
-            masaniello_base_balance=20.0,
-            masaniello_max_session_losses=int(os.getenv("APP_MASANIELLO_MAX_SESSION_LOSSES", "3")),
+            session_max_messages=max(1, session_max_messages),
+            session_target_profit=max(0.01, session_target_profit),
+            session_target_profit_per_win=max(0.01, session_target_profit_per_win),
+            session_stop_loss_count=max(1, session_stop_loss_count),
+            masaniello_n_ops=max(1, session_max_messages),
+            masaniello_w_needed=max(1, legacy_w_needed),
+            masaniello_base_balance=float(os.getenv("APP_MASANIELLO_BASE_BALANCE", "20.0")),
+            masaniello_max_session_losses=max(1, session_stop_loss_count),
             masaniello_loss_brake_enabled=_to_bool(
                 os.getenv("APP_MASANIELLO_LOSS_BRAKE_ENABLED", "true")
             ),
@@ -213,8 +237,12 @@ class AppSettings:
             max_trade_pct=float(os.getenv("APP_MAX_TRADE_PCT", "0.10")),
             max_total_exposure_pct=float(os.getenv("APP_MAX_TOTAL_EXPOSURE_PCT", "0.25")),
             calc_base_balance=float(os.getenv("APP_CALC_BASE_BALANCE", "300")),
-            recovery_g1_mult=float(os.getenv("APP_RECOVERY_G1_MULT", "").strip() or "0"),
-            recovery_g2_mult=float(os.getenv("APP_RECOVERY_G2_MULT", "").strip() or "0"),
+            recovery_g1_mult=float(
+                os.getenv("APP_RECOVERY_G1_MULT", os.getenv("APP_G1_MULTIPLIER", "")).strip() or "0"
+            ),
+            recovery_g2_mult=float(
+                os.getenv("APP_RECOVERY_G2_MULT", os.getenv("APP_G2_MULTIPLIER", "")).strip() or "0"
+            ),
             equity_bands_enabled=_to_bool(os.getenv("APP_EQUITY_BANDS_ENABLED", "false")),
             equity_bands=_parse_equity_bands(
                 os.getenv("APP_EQUITY_BANDS", "0:300,400:500,700:800,1200:1500")

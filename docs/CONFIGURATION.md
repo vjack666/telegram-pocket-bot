@@ -53,6 +53,10 @@ Usa `.env.example` como plantilla base.
 
 | Variable                                  | Tipo      | Defecto    | Descripción |
 |-------------------------------------------|-----------|------------|-------------|
+| `APP_SESSION_MAX_MESSAGES`                | int       | `6`        | Máximo de mensajes por sesión automática |
+| `APP_SESSION_TARGET_PROFIT`               | float     | `10.0`     | Objetivo neto por sesión |
+| `APP_SESSION_TARGET_PROFIT_PER_WIN`       | float     | `5.0`      | Ganancia neta esperada por WIN para el cálculo de stake |
+| `APP_SESSION_STOP_LOSS_COUNT`             | int       | `3`        | Cierre de sesión por stop loss al alcanzar este número de losses |
 | `APP_PAYOUT_DEFAULT`                      | float     | `92`       | Payout fallback (%) cuando no se puede leer payout dinámico del broker |
 | `POCKET_MIN_ORDER_AMOUNT`                 | float     | `1.0`      | Monto mínimo permitido para escribir en la UI del broker |
 | `APP_MASANIELLO_LOSS_BRAKE_ENABLED`       | bool      | `true`     | Activa freno progresivo por pérdidas recientes |
@@ -62,6 +66,8 @@ Usa `.env.example` como plantilla base.
 
 Notas:
 - El modo automático actual usa SessionManager con objetivo por sesión (2 wins o 3 losses, máximo 6 mensajes).
+- `main.py` construye `SessionManager` usando `APP_SESSION_*`.
+- Fallback legacy: si `APP_SESSION_MAX_MESSAGES` no está definido, se usa `APP_MASANIELLO_N_OPS`; si `APP_SESSION_STOP_LOSS_COUNT` no está definido, se usa `APP_MASANIELLO_MAX_SESSION_LOSSES`.
 - `APP_MARTINGALE_MODE` y variables de `calculator` quedan como compatibilidad legacy, no como estrategia automática principal.
 
 ---

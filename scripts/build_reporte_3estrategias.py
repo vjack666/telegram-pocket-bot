@@ -23,7 +23,8 @@ from pathlib import Path
 # ─── Rutas ───────────────────────────────────────────────────────────────────
 PATH_AB  = Path("runtime/_temp_ab_operacion.csv")
 PATH_C   = Path("runtime/Detalle_SimulacionC_Sesiones10.csv")
-OUT      = Path("runtime/Reporte_Comparativo_3Estrategias_100USD.xlsx")
+OUT      = Path("runtime/Reporte_Comparativo_Recovery_Cycle.xlsx")
+OUT_TEMP = Path("runtime/_Reporte_Comparativo_Recovery_Cycle_temp.xlsx")
 
 PAYOUT        = 0.92
 OBJETIVO_WIN  = 5.0
@@ -354,7 +355,10 @@ ws4 = wb.create_sheet("Detalle_C")
 
 cols_c = ["ID_Sesion","Señales_Jugadas","Wins","Losses","Estado",
           "Resultado_Sesion_USD","Max_Exposure_USD","Capital_Despues",
-          "Capital_Negativo","Stakes_Log"]
+          "Balance_Objetivo","Capital_Negativo","Stakes_Log"]
+
+if "Balance_Objetivo" not in df_c.columns:
+    df_c["Balance_Objetivo"] = None
 fills_estado = {
     "TP_Alcanzado" : C_GREEN,
     "SL_Activado"  : C_RED,
@@ -373,15 +377,16 @@ for r_i, row_data in enumerate(df_c[cols_c].itertuples(index=False), start=2):
     vals = [row_data.ID_Sesion, row_data.Señales_Jugadas, row_data.Wins,
             row_data.Losses, row_data.Estado, row_data.Resultado_Sesion_USD,
             row_data.Max_Exposure_USD, row_data.Capital_Despues,
+            row_data.Balance_Objetivo,
             "⚠ SÍ" if row_data.Capital_Negativo else "No",
             row_data.Stakes_Log]
     for col_i, val in enumerate(vals, start=1):
         c = ws4.cell(row=r_i, column=col_i, value=val)
         c.fill = fill(bg); c.font = nfont(size=9)
-        c.alignment = Alignment(horizontal="left" if col_i == 10 else "center", vertical="center")
+        c.alignment = Alignment(horizontal="left" if col_i == 11 else "center", vertical="center")
         c.border = border()
 
-widths_c = [10, 15, 8, 8, 16, 22, 20, 18, 16, 75]
+widths_c = [10, 15, 8, 8, 16, 22, 20, 18, 18, 16, 75]
 for col_i, w in enumerate(widths_c, start=1):
     ws4.column_dimensions[get_column_letter(col_i)].width = w
 
@@ -458,6 +463,21 @@ for col_l, w in zip(["A","B","C","D","E"], [24, 14, 22, 22, 28]):
     ws5.column_dimensions[col_l].width = w
 
 # ─── Guardar ─────────────────────────────────────────────────────────────────
-wb.save(OUT)
+wb.save(OUT_TEMP)
+import shutil
+import time
+import os
+try:
+    if OUT.exists():
+        for _ in range(3):
+            try:
+                OUT.unlink()
+                break
+            except PermissionError:
+                time.sleep(0.2)
+except:
+    pass
+time.sleep(0.1)
+shutil.move(str(OUT_TEMP), str(OUT))
 print(f"\n✓ Excel guardado en: {OUT}")
 print(f"  Hojas: {[s.title for s in wb.worksheets]}")

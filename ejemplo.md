@@ -66083,3 +66083,31 @@ EUR/NZD OTC - 17:20 -> PÉRDIDA ❌
 📌 Enviaremos 6 señales de ALTA CALIDAD!
 📣 Mantente atento y prepárate! 🚀
 
+[12/05/2026 21:31:44] VIP TRADER A: 💵 AUD/USD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 21:35
+🔴 ABAJO
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 21:40
+2️⃣ MARTINGALA A LAS 21:45
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[12/05/2026 21:50:16] VIP TRADER A: VICTORIA EN 2ª MARTINGALA ✅🤑
+
+[12/05/2026 21:51:50] VIP TRADER A: 💵 GBP/USD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 21:55
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 22:00
+2️⃣ MARTINGALA A LAS 22:05
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+

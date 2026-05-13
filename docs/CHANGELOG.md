@@ -5,6 +5,22 @@ Formato: `[FECHA] Descripción — Archivo(s) afectado(s)`
 
 ---
 
+## [2026-05-13] — Modo Recuperación con Memoria de Saldo Máximo
+
+- Se implementó High Water Mark en SessionManager para recuperación basada en balance real.
+- Nueva regla de deuda: `deuda = balance_maximo_historico - balance_actual` al cerrar una señal en LOSS.
+- Mientras `en_recuperacion` esté activo, el engine fuerza secuencia plana especial `17/17/17`.
+- El retorno al stake normal se habilita solo con `balance_actual >= (balance_maximo_historico + 1.00)`.
+- Se agregaron mensajes de consola de progreso de recuperación tras cada señal cerrada.
+- Se agregó columna `Balance_Objetivo` al detalle C de simulación y al reporte consolidado.
+
+Archivos principales:
+- src/core/session_manager.py
+- src/core/engine.py
+- src/core/manual_operation_tracker.py
+- scripts/simulate_estrategia_c.py
+- scripts/build_reporte_3estrategias.py
+
 ## [2026-04-26] — Sesión de estabilización y limpieza de terminal
 
 ### Problema 1 resuelto: Spam de logs de reconexión cada 60 segundos

@@ -30,13 +30,51 @@ OBJETIVO_WIN   = 5.0          # $5 netos por mensaje ganado
 CAPITAL_INICIAL = 100.0
 TP_WINS        = 2            # Take Profit al llegar a 2 wins
 SL_LOSSES      = 3            # Stop Loss al llegar a 3 losses
-CSV_PATH       = Path("runtime/Data_Sesiones_Binarias.csv")
+STAKE_NORMAL   = 5.43
+STAKE_RECOVERY = 17.0
+LOSS_TELEGRAM_USD = 7.0
+
+CSV_PATH       = Path("runtime/backtest_masaniello_ejemplo.csv")
+CSV_PATH_FALLBACK = Path("runtime/Data_Sesiones_Binarias.csv")
 EXCEL_OUT      = Path("runtime/Reporte_Comparativo_3Estrategias_100USD.xlsx")
 EXCEL_PREV     = Path("runtime/Reporte_Comparativo_MacroRecuperacion_100USD.xlsx")
 
+def _load_dataset() -> pd.DataFrame:
+    """Carga dataset de backtest y normaliza columnas para simulación."""
+    source_path = CSV_PATH if CSV_PATH.exists() else CSV_PATH_FALLBACK
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f"No se encontró dataset en {CSV_PATH} ni en {CSV_PATH_FALLBACK}"
+        )
+
+    data = pd.read_csv(source_path)
+
+    # Normalización de columnas entre datasets legacy y dataset realista.
+    rename_map = {
+        "Resultado del Backtest": "Resultado",
+        "Ciclo Masaniello": "Ciclo_Masaniello",
+    }
+    for old_name, new_name in rename_map.items():
+        if old_name in data.columns and new_name not in data.columns:
+            data = data.rename(columns={old_name: new_name})
+
+    if "Resultado" not in data.columns:
+        raise ValueError("El CSV no contiene columna 'Resultado' o 'Resultado del Backtest'.")
+
+    # ID de sesión compatible con Estrategia C (bloques de 6 señales).
+    if "ID_Sesion" not in data.columns:
+        data["ID_Sesion"] = (data.index // 6) + 1
+
+    # Fallback para A/B cuando el dataset no trae ciclo explícito.
+    if "Ciclo_Masaniello" not in data.columns:
+        data["Ciclo_Masaniello"] = data["ID_Sesion"]
+
+    data["es_win"] = data["Resultado"].astype(str).isin(["Win Directo", "Win Gale", "Win Gale 2"])
+    return data
+
+
 # ─── Carga de datos ──────────────────────────────────────────────────────────
-df = pd.read_csv(CSV_PATH)
-df["es_win"] = df["Resultado"].isin(["Win Directo", "Win Gale", "Win Gale 2"])
+df = _load_dataset()
 
 # ─── Simulación Estrategia C ─────────────────────────────────────────────────
 
@@ -140,12 +178,14 @@ def simular_estrategia_c_v2(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
     """
     sesiones_ids = df["ID_Sesion"].unique()
     capital      = CAPITAL_INICIAL
+    balance_maximo_historico = CAPITAL_INICIAL
     capital_min  = CAPITAL_INICIAL
     quiebras     = 0
     curva_capital = [CAPITAL_INICIAL]
     registros    = []
 
     for sid in sesiones_ids:
+        balance_objetivo = round(balance_maximo_historico + 1.0, 4)
         bloque = df[df["ID_Sesion"] == sid].copy()
         señales = bloque["es_win"].tolist()
 
@@ -206,9 +246,13 @@ def simular_estrategia_c_v2(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
             "Resultado_Sesion_USD"  : round(resultado_sesion, 4),
             "Max_Exposure_USD"      : round(max_exposure, 4),
             "Capital_Despues"       : round(capital, 4),
+            "Balance_Objetivo"      : balance_objetivo,
             "Capital_Negativo"      : capital < 0,
             "Stakes_Log"            : " | ".join(stakes_log),
         })
+
+        if capital > balance_maximo_historico:
+            balance_maximo_historico = capital
 
     df_out = pd.DataFrame(registros)
     print(f"\n{'='*55}")
@@ -232,6 +276,119 @@ def simular_estrategia_c_v2(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
     print(f"  PnL Neto                : ${ganancia_tp + perdida_sl:.2f}")
     print(f"{'='*55}\n")
     return df_out, curva_capital
+
+
+def _calcular_pnl_realista(resultado: str, stake: float) -> float:
+    """PnL por señal considerando costo intraseñal de Gale(s)."""
+    normalized = str(resultado).strip().lower()
+    if normalized == "loss":
+        return -LOSS_TELEGRAM_USD
+    if "gale 2" in normalized:
+        return (stake * PAYOUT) - (2.0 * stake)
+    if "gale" in normalized:
+        return (stake * PAYOUT) - stake
+    return stake * PAYOUT
+
+
+def simular_estrategia_c_realista(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, list[float], list[float]]:
+    """Simulación evolutiva con memoria real de deuda (persistente en todo el dataset)."""
+    balance_actual = CAPITAL_INICIAL
+    max_balance_alcanzado = CAPITAL_INICIAL
+    en_recuperacion = False
+    balance_objetivo = max_balance_alcanzado + 1.0
+
+    detalle_rows: list[dict] = []
+    curva_balance = [round(balance_actual, 4)]
+    curva_objetivo = [round(balance_objetivo, 4)]
+
+    for idx, row in enumerate(df.itertuples(index=False), start=1):
+        resultado = str(getattr(row, "Resultado"))
+        id_sesion = int(getattr(row, "ID_Sesion"))
+
+        if balance_actual > max_balance_alcanzado and not en_recuperacion:
+            max_balance_alcanzado = balance_actual
+
+        if en_recuperacion:
+            stake_usado = STAKE_RECOVERY
+            estado_recuperacion = "Si"
+        else:
+            stake_usado = STAKE_NORMAL
+            estado_recuperacion = "No"
+
+        balance_antes = balance_actual
+        pnl_senal = _calcular_pnl_realista(resultado, stake_usado)
+        balance_actual = balance_actual + pnl_senal
+
+        if str(resultado).strip().lower() == "loss":
+            en_recuperacion = True
+            balance_objetivo = max_balance_alcanzado + 1.0
+
+        deuda_pendiente = 0.0
+        if en_recuperacion:
+            deuda_pendiente = max(0.0, balance_objetivo - balance_actual)
+            if balance_actual >= balance_objetivo:
+                en_recuperacion = False
+                deuda_pendiente = 0.0
+                if balance_actual > max_balance_alcanzado:
+                    max_balance_alcanzado = balance_actual
+                balance_objetivo = max_balance_alcanzado + 1.0
+        else:
+            if balance_actual > max_balance_alcanzado:
+                max_balance_alcanzado = balance_actual
+            balance_objetivo = max_balance_alcanzado + 1.0
+
+        detalle_rows.append(
+            {
+                "N_Senal": idx,
+                "ID_Sesion": id_sesion,
+                "Resultado": resultado,
+                "Balance_Antes": round(balance_antes, 4),
+                "Estado_Recuperacion": estado_recuperacion,
+                "Deuda_Pendiente": round(deuda_pendiente, 4),
+                "Stake_Usado": round(stake_usado, 2),
+                "PnL_Senal_USD": round(pnl_senal, 4),
+                "Balance_Objetivo": round(balance_objetivo, 4),
+                "Balance_Despues": round(balance_actual, 4),
+                "Balance_Critico_LT30": "Si" if balance_actual < 30.0 else "No",
+                "Max_Balance_Alcanzado": round(max_balance_alcanzado, 4),
+            }
+        )
+        curva_balance.append(round(balance_actual, 4))
+        curva_objetivo.append(round(balance_objetivo, 4))
+
+    detalle_df = pd.DataFrame(detalle_rows)
+
+    summary_rows: list[dict] = []
+    for sid, block in detalle_df.groupby("ID_Sesion", sort=True):
+        wins_sesion = int((block["Resultado"].str.lower() != "loss").sum())
+        losses_sesion = int((block["Resultado"].str.lower() == "loss").sum())
+        if wins_sesion >= TP_WINS:
+            estado = "TP_Alcanzado"
+        elif losses_sesion >= SL_LOSSES:
+            estado = "SL_Activado"
+        else:
+            estado = "Sesion_Agotada"
+
+        summary_rows.append(
+            {
+                "ID_Sesion": int(sid),
+                "Señales_Jugadas": int(len(block)),
+                "Wins": wins_sesion,
+                "Losses": losses_sesion,
+                "Estado": estado,
+                "Resultado_Sesion_USD": round(float(block["PnL_Senal_USD"].sum()), 4),
+                "Max_Exposure_USD": round(float(block["Deuda_Pendiente"].max()), 4),
+                "Capital_Despues": round(float(block["Balance_Despues"].iloc[-1]), 4),
+                "Balance_Objetivo": round(float(block["Balance_Objetivo"].iloc[-1]), 4),
+                "Capital_Negativo": bool((block["Balance_Despues"] < 0).any()),
+                "Stakes_Log": " | ".join(
+                    [f"{res}:{stake:.2f}" for res, stake in zip(block["Resultado"], block["Stake_Usado"])]
+                ),
+            }
+        )
+
+    df_resumen = pd.DataFrame(summary_rows)
+    return df_resumen, detalle_df, curva_balance, curva_objetivo
 
 
 # ─── Cargar curvas A y B del Excel anterior ──────────────────────────────────
@@ -369,8 +526,17 @@ def thin_border():
     s = Side(border_style="thin", color="CCCCCC")
     return Border(left=s, right=s, top=s, bottom=s)
 
-def generar_excel(df_c: pd.DataFrame, curva_c: list, curva_a: list, stats_a: dict,
-                  curva_b: list, stats_b: dict, out_path: Path):
+def generar_excel(
+    df_c: pd.DataFrame,
+    df_c_realista: pd.DataFrame,
+    curva_c: list,
+    curva_objetivo: list,
+    curva_a: list,
+    stats_a: dict,
+    curva_b: list,
+    stats_b: dict,
+    out_path: Path,
+):
 
     wb = openpyxl.Workbook()
 
@@ -543,12 +709,56 @@ def generar_excel(df_c: pd.DataFrame, curva_c: list, curva_a: list, stats_a: dic
 
     ws2.add_chart(chart, "F2")
 
-    # ── Hoja 3: Detalle Estrategia C ─────────────────────────────────────────
+    # ── Hoja 3: Curva recuperación realista (balance vs línea deuda) ───────
+    wsr = wb.create_sheet("Curva_Recuperacion")
+    wsr["A1"].value = "# Señal"
+    wsr["B1"].value = "Balance_Actual"
+    wsr["C1"].value = "Linea_Deuda (Objetivo)"
+    for cell in wsr[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = color_hex(COLOR_HEADER)
+        cell.alignment = Alignment(horizontal="center")
+
+    max_len_real = max(len(curva_c), len(curva_objetivo))
+    step_real = max(1, max_len_real // 1200)
+    sampled_idx = list(range(0, max_len_real, step_real))
+    for r_i, idx in enumerate(sampled_idx, start=2):
+        bal = curva_c[idx] if idx < len(curva_c) else curva_c[-1]
+        obj = curva_objetivo[idx] if idx < len(curva_objetivo) else curva_objetivo[-1]
+        wsr.cell(row=r_i, column=1, value=idx)
+        wsr.cell(row=r_i, column=2, value=bal)
+        wsr.cell(row=r_i, column=3, value=obj)
+
+    rec_chart = LineChart()
+    rec_chart.title = "Balance Actual vs Linea de Deuda"
+    rec_chart.style = 10
+    rec_chart.y_axis.title = "Capital ($)"
+    rec_chart.x_axis.title = "Señal #"
+    rec_chart.width = 28
+    rec_chart.height = 14
+
+    n_real_rows = len(sampled_idx) + 1
+    data_balance = Reference(wsr, min_col=2, min_row=1, max_row=n_real_rows)
+    data_objetivo = Reference(wsr, min_col=3, min_row=1, max_row=n_real_rows)
+    rec_chart.add_data(data_balance, titles_from_data=True)
+    rec_chart.add_data(data_objetivo, titles_from_data=True)
+    rec_chart.series[0].graphicalProperties.line.solidFill = "0D7377"
+    rec_chart.series[0].graphicalProperties.line.width = 18000
+    rec_chart.series[1].graphicalProperties.line.solidFill = "E94560"
+    rec_chart.series[1].graphicalProperties.line.width = 18000
+    wsr.add_chart(rec_chart, "E2")
+
+    wsr.column_dimensions["A"].width = 12
+    wsr.column_dimensions["B"].width = 18
+    wsr.column_dimensions["C"].width = 24
+    wsr.freeze_panes = "A2"
+
+    # ── Hoja 4: Detalle Estrategia C (resumen por sesión) ───────────────────
     ws3 = wb.create_sheet("Detalle_C")
     headers_c = [
         "ID_Sesion", "Señales_Jugadas", "Wins", "Losses",
         "Estado", "Resultado_Sesion_USD", "Max_Exposure_USD",
-        "Capital_Despues", "Capital_Negativo", "Stakes_Log"
+        "Capital_Despues", "Balance_Objetivo", "Capital_Negativo", "Stakes_Log"
     ]
     col_fills_c = {
         "TP_Alcanzado" : "D5F5E3",
@@ -569,23 +779,69 @@ def generar_excel(df_c: pd.DataFrame, curva_c: list, curva_a: list, stats_a: dic
             row_data.ID_Sesion, row_data.Señales_Jugadas, row_data.Wins,
             row_data.Losses, row_data.Estado, row_data.Resultado_Sesion_USD,
             row_data.Max_Exposure_USD, row_data.Capital_Despues,
+            row_data.Balance_Objetivo,
             "SÍ ⚠" if row_data.Capital_Negativo else "No",
             row_data.Stakes_Log
         ], start=1):
             c = ws3.cell(row=r_i, column=col_i, value=val)
             c.fill = color_hex(bg)
             c.font = Font(size=9)
-            c.alignment = Alignment(horizontal="center" if col_i != 10 else "left")
+            c.alignment = Alignment(horizontal="center" if col_i != 11 else "left")
             c.border = thin_border()
 
     # Congelar encabezados
     ws3.freeze_panes = "A2"
     # Anchos
-    widths_c = [10, 16, 8, 8, 16, 22, 20, 18, 16, 80]
+    widths_c = [10, 16, 8, 8, 16, 22, 20, 18, 18, 16, 80]
     for col_i, w in enumerate(widths_c, start=1):
         ws3.column_dimensions[get_column_letter(col_i)].width = w
 
-    # ── Hoja 4: Análisis de Punto de Quiebre ─────────────────────────────────
+    # ── Hoja 5: Detalle realista (paso a paso) ───────────────────────────────
+    ws5 = wb.create_sheet("Detalle_C_Realista")
+    headers_real = [
+        "N_Senal",
+        "ID_Sesion",
+        "Resultado",
+        "Balance_Antes",
+        "Estado_Recuperacion",
+        "Deuda_Pendiente",
+        "Stake_Usado",
+        "PnL_Senal_USD",
+        "Balance_Objetivo",
+        "Balance_Despues",
+        "Balance_Critico_LT30",
+        "Max_Balance_Alcanzado",
+    ]
+    for col_i, h in enumerate(headers_real, start=1):
+        c = ws5.cell(row=1, column=col_i, value=h)
+        c.fill = color_hex(COLOR_HEADER)
+        c.font = Font(bold=True, color="FFFFFF", size=10)
+        c.alignment = Alignment(horizontal="center")
+        c.border = thin_border()
+
+    for r_i, row_data in enumerate(df_c_realista[headers_real].itertuples(index=False), start=2):
+        warn_recovery = str(row_data.Estado_Recuperacion) == "Si"
+        warn_critical = str(row_data.Balance_Critico_LT30) == "Si"
+        if warn_critical:
+            bg = "FADBD8"
+        elif warn_recovery:
+            bg = "FEF9E7"
+        else:
+            bg = "FFFFFF"
+
+        for col_i, val in enumerate(row_data, start=1):
+            c = ws5.cell(row=r_i, column=col_i, value=val)
+            c.fill = color_hex(bg)
+            c.font = Font(size=9)
+            c.alignment = Alignment(horizontal="center")
+            c.border = thin_border()
+
+    ws5.freeze_panes = "A2"
+    widths_real = [10, 10, 14, 15, 18, 15, 12, 12, 16, 15, 19, 20]
+    for col_i, w in enumerate(widths_real, start=1):
+        ws5.column_dimensions[get_column_letter(col_i)].width = w
+
+    # ── Hoja 6: Análisis de Punto de Quiebre ─────────────────────────────────
     ws4 = wb.create_sheet("Punto_de_Quiebre")
     ws4.merge_cells("A1:F1")
     c = ws4["A1"]
@@ -658,7 +914,7 @@ def generar_excel(df_c: pd.DataFrame, curva_c: list, curva_a: list, stats_a: dic
 # ─── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("[1/4] Ejecutando Simulación C...")
-    df_c, curva_c = simular_estrategia_c_v2(df)
+    df_c, df_c_realista, curva_c, curva_objetivo = simular_estrategia_c_realista(df)
 
     print("[2/4] Ejecutando Simulación A (Masaniello, referencia)...")
     curva_a, stats_a = simular_estrategia_a(df)
@@ -667,10 +923,24 @@ if __name__ == "__main__":
     curva_b, stats_b = simular_estrategia_b(df)
 
     print("[4/4] Generando Excel comparativo...")
-    generar_excel(df_c, curva_c, curva_a, stats_a, curva_b, stats_b, EXCEL_OUT)
+    generar_excel(
+        df_c=df_c,
+        df_c_realista=df_c_realista,
+        curva_c=curva_c,
+        curva_objetivo=curva_objetivo,
+        curva_a=curva_a,
+        stats_a=stats_a,
+        curva_b=curva_b,
+        stats_b=stats_b,
+        out_path=EXCEL_OUT,
+    )
 
-    # Guardar también el detalle C como CSV
+    # Guardar detalle C por sesión y detalle realista paso a paso.
     csv_c_out = Path("runtime/Detalle_SimulacionC_Sesiones10.csv")
     df_c.to_csv(csv_c_out, index=False, encoding="utf-8-sig")
     print(f"[OK] CSV detalle guardado en: {csv_c_out}")
+
+    csv_real_out = Path("runtime/Detalle_C_Realista.csv")
+    df_c_realista.to_csv(csv_real_out, index=False, encoding="utf-8-sig")
+    print(f"[OK] CSV realista guardado en: {csv_real_out}")
     print("\n✓ Simulación completada.")

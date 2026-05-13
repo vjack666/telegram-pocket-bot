@@ -27,8 +27,10 @@ class SessionLearningDB:
         *,
         asset: str,
         side: str,
-        masaniello_sequence: str,          # ej. "WL", "LL", "W"
-        masaniello_label: str,             # ej. "M3 tras 2L"
+        session_sequence: str | None = None,
+        session_label: str | None = None,
+        masaniello_sequence: str | None = None,
+        masaniello_label: str | None = None,
         step_reached: int,                 # 0=E, 1=G1, 2=G2
         g2_intervened: bool,               # True = el humano fue consultado
         g2_approved: Optional[bool],       # True=aprobó, False=canceló, None=no llegó a G2
@@ -38,12 +40,14 @@ class SessionLearningDB:
         market_note: str = "",             # nota del usuario: "Volátil", "Lento", "Tendencial"
         expiry_minutes: int = 1,
     ) -> None:
+        seq = (session_sequence if session_sequence is not None else masaniello_sequence) or ""
+        label = (session_label if session_label is not None else masaniello_label) or ""
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "asset": asset,
             "side": side,
-            "masaniello_sequence": masaniello_sequence,
-            "masaniello_label": masaniello_label,
+            "masaniello_sequence": seq,
+            "masaniello_label": label,
             "step_reached": step_reached,
             "g2_intervened": g2_intervened,
             "g2_approved": g2_approved,

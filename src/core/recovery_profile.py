@@ -6,7 +6,7 @@ class RecoveryProfile:
 
     Aplica el cap de exposición a TODOS los pasos (entrada, G1, G2) en
     todos los modos. Los multiplicadores g1_mult / g2_mult son usados por
-    el modo 'calculator'; Masaniello los usa solo como referencia de gale.
+    el modo 'calculator'; en modo sesión sirven como referencia de gale.
 
     Regla de cap: siempre min(raw_stake, cap) ANTES de round(), para
     evitar excesos por rounding.

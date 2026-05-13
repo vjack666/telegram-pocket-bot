@@ -28,6 +28,7 @@ from src.core.daily_profit_tracker import DailyProfitTracker
 from src.core.manual_operation_tracker import ManualOperationTracker
 from src.core.manual_operation_cli import ManualOperationCLI
 from src.core.session_state_persistence import SessionStatePersistence
+from src.strategies.manual_strategies import MasanielloSessionState
 from src.pocket_option.client import PocketOptionDemoClient
 from src.utils.blackbox import DeferredBlackBoxRecorder, ShutdownSnapshot
 from src.utils.session_learning_db import SessionLearningDB
@@ -381,11 +382,19 @@ async def run() -> None:
             return
 
         session_manager = SessionManager(
-            max_messages_per_session=6,
-            target_profit_session=10.0,
-            target_profit_per_win=5.0,
-            stop_loss_count=3,
+            max_messages_per_session=settings.session_max_messages,
+            target_profit_session=settings.session_target_profit,
+            target_profit_per_win=settings.session_target_profit_per_win,
+            stop_loss_count=settings.session_stop_loss_count,
             payout=runtime_payout_percent / 100.0,
+        )
+        logging.info(
+            "[SessionConfig] msgs=%d target=%.2f target_win=%.2f stop_loss=%d payout=%.2f%%",
+            settings.session_max_messages,
+            settings.session_target_profit,
+            settings.session_target_profit_per_win,
+            settings.session_stop_loss_count,
+            runtime_payout_percent,
         )
 
         session_state_path = _RUNTIME_BASE_DIR / "session_state.json"
@@ -501,10 +510,19 @@ async def run() -> None:
 
         # ── Manual Operation Tracker ───────────────────────────────────────
         manual_operation_tracker = None
+        manual_strategy_state = None
         if settings.manual_operations_enabled:
+            manual_strategy_state = MasanielloSessionState(
+                n_ops=settings.masaniello_n_ops,
+                w_needed=settings.masaniello_w_needed,
+                base_balance=settings.masaniello_base_balance,
+                payout_mult=1.0 + (runtime_payout_percent / 100.0),
+                max_losses=settings.session_stop_loss_count,
+            )
             manual_operation_tracker = ManualOperationTracker(
                 global_gale_state=global_gale_state,
                 session_manager=session_manager,
+                manual_strategy=manual_strategy_state,
             )
             logging.info(
                 "[ManualOperations] ACTIVO | Sistema de registro de operaciones manuales habilitado"
@@ -520,7 +538,7 @@ async def run() -> None:
 
         engine = SignalEngine(
             pocket_client=pocket_client,
-            martingale_amounts=settings.martingale_amounts,
+            martingale_amounts=[1.09, 2.27, 4.73],  # Updated amounts for Telegram auto mode
             martingale_mode=settings.martingale_mode,
             calc_payout_percent=runtime_payout_percent,
             calc_increment=settings.calc_increment,
@@ -539,16 +557,13 @@ async def run() -> None:
             daily_profit_tracker=daily_profit_tracker,
             manual_operation_tracker=manual_operation_tracker,
             pocket_min_order_amount=settings.pocket_min_order_amount,
-            masaniello_loss_brake_enabled=settings.masaniello_loss_brake_enabled,
-            masaniello_loss_brake_window_minutes=settings.masaniello_loss_brake_window_minutes,
-            masaniello_loss_brake_step=settings.masaniello_loss_brake_step,
-            masaniello_loss_brake_floor=settings.masaniello_loss_brake_floor,
+            session_loss_brake_enabled=settings.masaniello_loss_brake_enabled,
+            session_loss_brake_window_minutes=settings.masaniello_loss_brake_window_minutes,
+            session_loss_brake_step=settings.masaniello_loss_brake_step,
+            session_loss_brake_floor=settings.masaniello_loss_brake_floor,
         )
         # ── Escribir monto inicial sugerido por SessionManager en el broker ──
-        _startup_amount = round(
-            max(settings.pocket_min_order_amount, session_manager.current_entry_stake()),
-            2,
-        )
+        _startup_amount = session_manager.get_next_stake(settings.pocket_min_order_amount)
         if _startup_amount and _startup_amount > 0:
             try:
                 await pocket_client.set_amount(_startup_amount, max_retries=3)
@@ -587,7 +602,10 @@ async def run() -> None:
 
         # ── Manual Operation CLI (opcional) ────────────────────────────────
         if settings.manual_operations_enabled and manual_operation_tracker is not None:
-            manual_cli = ManualOperationCLI(tracker=manual_operation_tracker)
+            manual_cli = ManualOperationCLI(
+                tracker=manual_operation_tracker,
+                manual_strategy=manual_strategy_state,
+            )
             logging.info(
                 "[ManualOperationsCLI] Sistema interactivo listo. "
                 "Puedes registrar operaciones manuales en cualquier momento durante la ejecución."

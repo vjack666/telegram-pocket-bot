@@ -26,6 +26,18 @@ class SessionManager:
     last_closed_at_utc: str = ""
     last_result_label: str = ""
 
+    # Ciclo de Recuperación Especial
+    deuda_acumulada: float = 0.0
+    en_recuperacion: bool = False
+    recovery_stake: float = 17.0
+    recovery_profit_per_win: float = 15.64  # valor recalculado en runtime
+
+    # Memoria de saldo maximo (High Water Mark)
+    balance_maximo_historico: float = 0.0
+    balance_actual: float = 0.0
+    balance_objetivo_incremento: float = 1.0
+    balance_objetivo_recuperacion: float = 0.0
+
     state_change_callback: Callable[["SessionManager", str], None] | None = field(default=None, repr=False)
 
     # Compatibilidad minima con el engine actual
@@ -39,6 +51,7 @@ class SessionManager:
     def __post_init__(self) -> None:
         self.n_ops = self.max_messages_per_session
         self.w_needed = int(self.target_profit_session / self.target_profit_per_win)
+        self._recompute_recovery_profit_per_win()
 
     @property
     def signals_consumed(self) -> int:
@@ -56,8 +69,66 @@ class SessionManager:
         self.accumulated_loss = max(0.0, float(amount))
         self._notify("sync_accumulated_loss")
 
+    def _recompute_recovery_profit_per_win(self) -> None:
+        self.recovery_profit_per_win = round(self.recovery_stake * max(0.01, self.payout), 2)
+
+    def observe_balance(self, current_balance: float) -> None:
+        """Observa balance en tiempo real y mantiene el High Water Mark.
+
+        Regla: solo actualiza balance_maximo_historico cuando no hay deuda pendiente.
+        """
+        balance = max(0.0, float(current_balance))
+        self.balance_actual = balance
+
+        if self.balance_maximo_historico <= 0.0:
+            self.balance_maximo_historico = balance
+
+        if not self.en_recuperacion and self.deuda_acumulada <= 0.0:
+            if balance > self.balance_maximo_historico:
+                self.balance_maximo_historico = balance
+
+    def should_use_recovery_sequence(self) -> bool:
+        """Indica si debe forzarse secuencia plana 17/17/17."""
+        return self.en_recuperacion
+
+    def recovery_target_balance(self) -> float:
+        if self.balance_objetivo_recuperacion > 0:
+            return self.balance_objetivo_recuperacion
+        if self.balance_maximo_historico > 0:
+            return self.balance_maximo_historico + self.balance_objetivo_incremento
+        return 0.0
+
+    def _print_recovery_progress(self) -> None:
+        if not self.en_recuperacion:
+            return
+
+        faltante_deuda = max(0.0, self.balance_maximo_historico - self.balance_actual)
+        target = self.recovery_target_balance()
+
+        if faltante_deuda > 0:
+            print(
+                f"⚠️ Recuperación en curso. Falta por cubrir: ${faltante_deuda:.2f} "
+                f"para alcanzar el máximo anterior."
+            )
+            return
+
+        print("✅ Deuda cubierta. Balance actual igualado al máximo anterior.")
+        if self.balance_actual >= target > 0:
+            print(
+                f"✅ Retorno habilitado: balance ${self.balance_actual:.2f} "
+                f">= objetivo ${target:.2f}."
+            )
+
     def get_next_stake(self, min_order: float = 0.01) -> float:
-        """API principal de stake para el motor automatico."""
+        """API principal de stake para el motor automatico.
+        
+        Si hay recuperacion activa, retorna recovery_stake ($17) para recuperación.
+        Si no, retorna stake normal basado en accumulated_loss + target_profit_per_win.
+        """
+        if self.should_use_recovery_sequence():
+            return self.recovery_stake
+
+        self.en_recuperacion = False
         stake = (self.accumulated_loss + self.target_profit_per_win) / max(0.01, self.payout)
         return round(max(float(min_order), stake), 2)
 
@@ -71,12 +142,19 @@ class SessionManager:
         stake = (projected_loss + self.target_profit_per_win) / max(0.01, self.payout)
         return round(max(0.01, stake), 2)
 
-    def update_session_status(self, result_label: str, debt_after_loss: float | None = None) -> dict:
+    def update_session_status(
+        self,
+        result_label: str,
+        debt_after_loss: float | None = None,
+        current_balance: float | None = None,
+    ) -> dict:
         """API principal para sincronizar resultado de una señal cerrada.
 
         result_label esperado:
         - WIN DIRECTO / G1 / G2 / WIN
         - LOSS
+
+        Gestiona también deuda_acumulada: suma en LOSS, resta en WIN durante recuperación.
         """
         if self.global_stop:
             return {
@@ -95,11 +173,35 @@ class SessionManager:
         self.messages_in_session += 1
         self.last_result_label = normalized
 
+        if current_balance is not None:
+            self.observe_balance(current_balance)
+
         if is_win:
             self.wins += 1
             self.accumulated_loss = 0.0
+
+            if self.en_recuperacion:
+                self.deuda_acumulada = max(0.0, self.balance_maximo_historico - self.balance_actual)
+                self._print_recovery_progress()
+
+                target = self.recovery_target_balance()
+                if self.deuda_acumulada <= 0 and self.balance_actual >= target > 0:
+                    self.en_recuperacion = False
+                    self.deuda_acumulada = 0.0
+                    self.balance_objetivo_recuperacion = 0.0
+
+                    # Al cerrar recuperacion, consolidar nuevo maximo.
+                    if self.balance_actual > self.balance_maximo_historico:
+                        self.balance_maximo_historico = self.balance_actual
         else:
             self.losses += 1
+
+            # Activar recuperacion por diferencia contra maximo historico.
+            self.en_recuperacion = True
+            self.deuda_acumulada = max(0.0, self.balance_maximo_historico - self.balance_actual)
+            self.balance_objetivo_recuperacion = self.balance_maximo_historico + self.balance_objetivo_incremento
+            self._print_recovery_progress()
+
             if debt_after_loss is not None:
                 self.accumulated_loss = max(0.0, float(debt_after_loss))
 
@@ -113,6 +215,11 @@ class SessionManager:
             "wins": self.wins,
             "losses": self.losses,
             "messages_in_session": self.messages_in_session,
+            "deuda_acumulada": self.deuda_acumulada,
+            "en_recuperacion": self.en_recuperacion,
+            "balance_maximo_historico": self.balance_maximo_historico,
+            "balance_actual": self.balance_actual,
+            "balance_objetivo_recuperacion": self.balance_objetivo_recuperacion,
         }
 
     def record_win(self) -> None:
@@ -162,6 +269,7 @@ class SessionManager:
         self.losses = 0
         self.accumulated_loss = 0.0
         self.last_result_label = ""
+        # NO reseteamos deuda_acumulada ni en_recuperacion ya que persisten entre sesiones
         if clear_stop_flags:
             self.session_blocked = False
             self.global_stop = False
@@ -180,6 +288,7 @@ class SessionManager:
 
     def update_payout_mult(self, payout_mult: float) -> None:
         self.payout = max(0.01, float(payout_mult) - 1.0)
+        self._recompute_recovery_profit_per_win()
 
     def to_dict(self) -> dict:
         return {
@@ -201,6 +310,14 @@ class SessionManager:
             "is_session_blocked": self.session_blocked,
             "global_stop": self.global_stop,
             "blocks_lost_today": self.blocks_lost_today,
+            "deuda_acumulada": self.deuda_acumulada,
+            "en_recuperacion": self.en_recuperacion,
+            "balance_maximo_historico": self.balance_maximo_historico,
+            "balance_actual": self.balance_actual,
+            "balance_objetivo_incremento": self.balance_objetivo_incremento,
+            "balance_objetivo_recuperacion": self.balance_objetivo_recuperacion,
+            "recovery_stake": self.recovery_stake,
+            "recovery_profit_per_win": self.recovery_profit_per_win,
         }
 
     def restore_state(self, state: dict, notify: bool = False) -> None:
@@ -217,5 +334,13 @@ class SessionManager:
         self.session_blocked = bool(state.get("is_session_blocked", False))
         self.global_stop = bool(state.get("global_stop", False))
         self.blocks_lost_today = int(state.get("blocks_lost_today", 0))
+        self.deuda_acumulada = float(state.get("deuda_acumulada", 0.0))
+        self.en_recuperacion = bool(state.get("en_recuperacion", False))
+        self.balance_maximo_historico = float(state.get("balance_maximo_historico", 0.0))
+        self.balance_actual = float(state.get("balance_actual", 0.0))
+        self.balance_objetivo_incremento = float(state.get("balance_objetivo_incremento", 1.0))
+        self.balance_objetivo_recuperacion = float(state.get("balance_objetivo_recuperacion", 0.0))
+        self.recovery_stake = float(state.get("recovery_stake", self.recovery_stake))
+        self._recompute_recovery_profit_per_win()
         if notify:
             self._notify("restore_state")

@@ -1,4 +1,3 @@
-from src.core.session_manager import SessionManager as MasanielloSessionState
 import asyncio
 import logging
 import shutil

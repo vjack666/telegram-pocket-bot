@@ -10,14 +10,19 @@ import logging
 from typing import Literal
 
 from src.core.manual_operation_tracker import ManualOperationTracker
-from src.core.pipeline import GlobalGaleState, MasanielloSessionState
+from src.strategies import manual_strategies
 
 
 class ManualOperationCLI:
     """CLI para registrar operaciones manuales del usuario."""
 
-    def __init__(self, tracker: ManualOperationTracker) -> None:
+    def __init__(
+        self,
+        tracker: ManualOperationTracker,
+        manual_strategy: object | None = None,
+    ) -> None:
         self._tracker = tracker
+        self._manual_strategy = manual_strategy
         self._running = False
 
     async def run_interactive_prompt(self) -> None:

@@ -2,13 +2,13 @@
 
 ## Descripción
 
-Sistema que permite registrar operaciones manuales que haces en Pocket Option cuando estás en **pérdida de Masaniello** y quieres intentar una recuperación manual.
+Sistema que permite registrar operaciones manuales que haces en Pocket Option cuando estás en **pérdida de sesión** y quieres intentar una recuperación manual.
 
 **Caso de uso:**
 1. Bot ejecuta una señal → **LOSS** en step 1 o 2
 2. Ves mejor el mercado y entras **manualmente con mayor stake**
-3. Tu entrada gana → Registras **WIN** → Masaniello resetea
-4. Tu entrada pierde → Registras **LOSS** → Masaniello continúa secuencia
+3. Tu entrada gana → Registras **WIN** → la sesión se normaliza
+4. Tu entrada pierde → Registras **LOSS** → la sesión continúa la secuencia
 
 ---
 
@@ -134,17 +134,19 @@ ManualOperationTracker.register_manual_operation()
         ↓
 ┌─ Si WIN:
 │  ├─ global_gale_state.record_win()    → resetea paso actual
-│  └─ masaniello_session.record_win()   → resetea sesión si completa
+│  ├─ session_manager.update_session_status("WIN")
+│  └─ manual_strategy.record_win()       → solo flujo manual (src/strategies)
 │
 ├─ Si LOSS:
 │  ├─ global_gale_state.record_loss()   → incrementa paso
-│  └─ masaniello_session.record_loss()  → incrementa contador
+│  ├─ session_manager.update_session_status("LOSS", debt_after_loss=...)
+│  └─ manual_strategy.record_loss(...)   → solo flujo manual (src/strategies)
 │
 └─ Si UNKNOWN:
    └─ No modifica estado (usuario investigará)
 ```
 
-### 2. Estado de Masaniello actualizado
+### 2. Estado de sesión actualizado
 
 Cuando registras una operación **WIN**:
 ```
@@ -152,9 +154,13 @@ GlobalGaleState:
   current_step = 0          (reseteado)
   accumulated_loss = 0.0    (reseteado)
 
-MasanielloSessionState:
+SessionManager:
   wins += 1
-  session_blocked = False   (desbloqueado si estaba)
+  accumulated_loss = 0.0
+  close_reason = take_profit_2_wins (si aplica)
+
+ManualStrategyState (opcional):
+  record_win() para mantener histórico manual separado
 ```
 
 Cuando registras una operación **LOSS**:
@@ -163,9 +169,13 @@ GlobalGaleState:
   current_step += 1         (avanza a siguiente gale)
   accumulated_loss += amount
 
-MasanielloSessionState:
+SessionManager:
   losses += 1
-  Si losses >= max_losses → sesión bloqueada
+  accumulated_loss = deuda global
+  close_reason = stop_loss_3_losses (si aplica)
+
+ManualStrategyState (opcional):
+  record_loss(amount) para mantener histórico manual separado
 ```
 
 ### 3. Historial y auditoría
@@ -199,7 +209,7 @@ Todas las operaciones se guardan en memoria (y opcionalmente en JSON):
 
 **Resultado:** La pérdida de $2 fue recuperada con ganancia neta de $2 ($4 - $2).
 
-### Escenario 2: LOSS manual continúa Masaniello
+### Escenario 2: LOSS manual continúa sesión
 
 ```
 [13:00] Signal bot BUY $2   → LOSS  (step 0 → 1)
@@ -207,9 +217,9 @@ Todas las operaciones se guardan en memoria (y opcionalmente en JSON):
 [13:10] Signal bot BUY $10  → debe ganar para recuperar $6
 ```
 
-**Resultado:** Masaniello continúa en step 2. Si bot WIN → ciclo resetea.
+**Resultado:** la sesión continúa en step 2. Si bot WIN → ciclo resetea.
 
-### Escenario 3: UNKNOWN no afecta Masaniello
+### Escenario 3: UNKNOWN no afecta sesión
 
 ```
 [13:00] Signal bot BUY $2   → LOSS  (step 0 → 1)
@@ -292,9 +302,9 @@ Cierre detectado (null):      2026-05-11 19:08:32.005141 UTC (+61.28s total)
 - ✅ Cierre detectado en **61.28 segundos** para M1 (esperado ~60s)
 - ✅ Panel text en apertura: `"EUR/USD OTC+92%$1+$1.92"` (sin timer en primer snapshot)
 - ✅ Timer eventualmente disponible en snapshots posteriores
-- ✅ Precisión de timestamps: **milisegundos**, apto para auditoría Masaniello
+- ✅ Precisión de timestamps: **milisegundos**, apto para auditoría de sesión
 
-**Conclusión:** El sistema 2-fase sin reloj funciona con precisión y tolerancia adecuadas para auditoría de operaciones manuales en Masaniello.
+**Conclusión:** El sistema 2-fase sin reloj funciona con precisión y tolerancia adecuadas para auditoría de operaciones manuales en sesiones.
 
 ---
 
@@ -321,13 +331,19 @@ Cierre detectado (null):      2026-05-11 19:08:32.005141 UTC (+61.28s total)
 
 ---
 
-## Ejemplo completo: Recuperación manual en Masaniello
+## Ejemplo completo: Recuperación manual en sesión
 
 **Configuración:**
 ```env
-APP_MARTINGALE_MODE=masaniello
+APP_MARTINGALE_MODE=session
+APP_SESSION_MAX_MESSAGES=6
+APP_SESSION_TARGET_PROFIT=10.0
+APP_SESSION_TARGET_PROFIT_PER_WIN=5.0
+APP_SESSION_STOP_LOSS_COUNT=3
+
+# Estrategia manual opcional (solo manual_strategies)
 APP_MASANIELLO_N_OPS=6
-APP_MASANIELLO_W_NEEDED=3
+APP_MASANIELLO_W_NEEDED=2
 APP_MASANIELLO_BASE_BALANCE=10.0
 ```
 
@@ -335,25 +351,25 @@ APP_MASANIELLO_BASE_BALANCE=10.0
 
 ```
 [14:00] Signal #1: EURUSD BUY $1.20  → LOSS
-        Masaniello: step 0→1, accumulated=$1.20
+  SessionManager: step 0→1, accumulated=$1.20
 
 [14:01] 🤔 Ves mala lectura. Entras manual BUY $2.40
         Balance antes: $98.80
         
 [14:02] Tu entrada WINS → Balance: $113.52
         ✅ Registras: BUY $2.40 → WIN
-        Masaniello: step 1→0, RESETEO ✅
+  SessionManager: step 1→0, RESETEO ✅
         
 [14:03] Signal #2: EURUSD SELL $1.20 → WIN
-        Masaniello: completaría sesión si llegara a 3 wins
+  SessionManager: avanza hacia take profit de sesión
         
 [14:04] Signal #3: EURUSD BUY $1.20  → WIN (3er win)
-        Masaniello: Sesión completada ✅
+  SessionManager: Sesión completada ✅
         Capital base aumenta si está en modo macro-gale
 ```
 
 **Resumen:**
 - Recuperaste $1.20 de pérdida + ganancia de $1.20
-- El Masaniello continuó funcionando normalmente
+- La sesión automática continuó funcionando normalmente
 - Auditoría completa: ¿cuándo entró manual y por qué?
 
