@@ -55,9 +55,14 @@ class AppSettings:
     busy_policy: str
     telegram_channel_names: Dict[str, str]
     session_max_messages: int
-    session_target_profit: float
-    session_target_profit_per_win: float
     session_stop_loss_count: int
+    masaniello_capital: float
+    masaniello_n: int
+    masaniello_k: int
+    masaniello_payout: float
+    masaniello_reinversion: float
+    masaniello_max_stake_pct: float
+    session_stop_loss_pct: float
     masaniello_n_ops: int
     masaniello_w_needed: int
     masaniello_base_balance: float
@@ -128,22 +133,21 @@ class AppSettings:
                 raise ValueError("Falta TELEGRAM_SOURCE_CHATS en .env")
 
         session_max_messages = int(
-            os.getenv("APP_SESSION_MAX_MESSAGES", os.getenv("APP_MASANIELLO_N_OPS", "6"))
+            os.getenv("APP_SESSION_MAX_MESSAGES", os.getenv("MASANIELLO_N", "20"))
         )
-        session_target_profit = float(os.getenv("APP_SESSION_TARGET_PROFIT", "10.0"))
-        session_target_profit_per_win = float(os.getenv("APP_SESSION_TARGET_PROFIT_PER_WIN", "5.0"))
         session_stop_loss_count = int(
             os.getenv(
                 "APP_SESSION_STOP_LOSS_COUNT",
                 os.getenv("APP_MASANIELLO_MAX_SESSION_LOSSES", "3"),
             )
         )
-        legacy_w_needed = int(
-            os.getenv(
-                "APP_MASANIELLO_W_NEEDED",
-                str(max(1, int(session_target_profit / max(0.01, session_target_profit_per_win)))),
-            )
-        )
+        masaniello_capital = float(os.getenv("MASANIELLO_CAPITAL", "100.0"))
+        masaniello_n = int(os.getenv("MASANIELLO_N", "20"))
+        masaniello_k = int(os.getenv("MASANIELLO_K", "13"))
+        masaniello_payout = float(os.getenv("MASANIELLO_PAYOUT", "0.92"))
+        masaniello_reinversion = float(os.getenv("MASANIELLO_REINVERSION", "0.5"))
+        masaniello_max_stake_pct = float(os.getenv("MASANIELLO_MAX_STAKE_PCT", "0.05"))
+        session_stop_loss_pct = float(os.getenv("APP_SESSION_STOP_LOSS_PCT", "0.20"))
 
         return AppSettings(
             enable_telegram=enable_telegram,
@@ -215,12 +219,17 @@ class AppSettings:
                 os.getenv("TELEGRAM_CHANNEL_NAMES", "")
             ),
             session_max_messages=max(1, session_max_messages),
-            session_target_profit=max(0.01, session_target_profit),
-            session_target_profit_per_win=max(0.01, session_target_profit_per_win),
             session_stop_loss_count=max(1, session_stop_loss_count),
-            masaniello_n_ops=max(1, session_max_messages),
-            masaniello_w_needed=max(1, legacy_w_needed),
-            masaniello_base_balance=float(os.getenv("APP_MASANIELLO_BASE_BALANCE", "20.0")),
+            masaniello_capital=max(0.0, masaniello_capital),
+            masaniello_n=max(1, masaniello_n),
+            masaniello_k=max(1, masaniello_k),
+            masaniello_payout=max(0.01, masaniello_payout),
+            masaniello_reinversion=max(0.0, masaniello_reinversion),
+            masaniello_max_stake_pct=max(0.0, min(1.0, masaniello_max_stake_pct)),
+            session_stop_loss_pct=max(0.0, min(0.95, session_stop_loss_pct)),
+            masaniello_n_ops=max(1, masaniello_n),
+            masaniello_w_needed=max(1, masaniello_k),
+            masaniello_base_balance=max(0.0, masaniello_capital),
             masaniello_max_session_losses=max(1, session_stop_loss_count),
             masaniello_loss_brake_enabled=_to_bool(
                 os.getenv("APP_MASANIELLO_LOSS_BRAKE_ENABLED", "true")

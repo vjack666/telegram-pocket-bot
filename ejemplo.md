@@ -66131,3 +66131,117 @@ Usa martingala si es necesario 👇
 📌 Enviaremos 6 señales de ALTA CALIDAD!
 📣 Mantente atento y prepárate! 🚀
 
+[13/05/2026 15:30:00] VIP TRADER A: ⚠️LA SESIÓN VIP COMIENZA EN 30 MINUTOS⚠️
+
+💰¡Prepara tu capital para SEÑALES VIP EXCLUSIVAS!
+
+🎯 6 SEÑALES DE ALTA CALIDAD están en camino
+
+📊Prepara tu cuenta aquí
+
+[13/05/2026 16:01:48] VIP TRADER A: 💵 EUR/USD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 16:05
+🔴 ABAJO
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 16:10
+2️⃣ MARTINGALA A LAS 16:15
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[13/05/2026 18:45:00] SMART SIGNALS: ⏰ Configura tus alarmas 🚨
+🌍 LA SESIÓN COMIENZA A LAS 19:00 (UTC -3)
+
+🚨 ZONAS HORARIAS POR PAÍS ⬇️
+
+🇻🇪 Comienza a las 18:00 – Venezuela (UTC-4)
+🇦🇷 Comienza a las 19:00 – Argentina (UTC-3)
+🇬🇹 Comienza a las 16:00 – Guatemala (UTC-6)
+🇨🇴 Comienza a las 17:00 – Colombia (UTC-5)
+🇧🇴 Comienza a las 18:00 – Bolivia (UTC-4)
+🇵🇦 Comienza a las 17:00 – Panamá (UTC-5)
+🇩🇴 Comienza a las 18:00 – República Dominicana (UTC-4)
+🇲🇽 Comienza a las 16:00 – México (UTC-6)
+🇨🇱 Comienza a las 19:00 – Chile (UTC-3)
+🇪🇨 Comienza a las 17:00 – Ecuador (UTC-5)
+🇪🇸 Comienza a las 23:00 – España (UTC+1)
+
+📌 Enviaremos 6 señales de ALTA CALIDAD!
+📣 Mantente atento y prepárate! 🚀
+
+[13/05/2026 18:59:00] SMART SIGNALS: Comenzamos operaciones 📊✅
+
+No olvides configurar la zona horaria en UTC-3 para seguir la señal en el horario correcto 👇👇
+
+[13/05/2026 19:01:48] SMART SIGNALS: 💵 USD/CAD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 19:05
+🔴 ABAJO
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 19:10
+2️⃣ MARTINGALA A LAS 19:15
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[13/05/2026 19:20:14] SMART SIGNALS: ❌ PÉRDIDA
+
+[13/05/2026 19:23:06] SMART SIGNALS: 💵 GBP/USD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 19:25
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 19:30
+2️⃣ MARTINGALA A LAS 19:35
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[13/05/2026 20:46:10] SMART SIGNALS: ⚡PROGRESO INCREÍBLE 💵
+
+📊El estudiante Andres mostró concentración y logró resultados reales
+
+🎯 El mercado abre puertas a quienes creen
+
+🙌 Continuamos juntos este viaje
+
+[13/05/2026 21:00:00] VIP TRADER A: ⚠️LA SESIÓN VIP COMIENZA EN 30 MINUTOS⚠️
+
+💰¡Prepara tu capital para SEÑALES VIP EXCLUSIVAS!
+
+🎯 6 SEÑALES DE ALTA CALIDAD están en camino
+
+📊Prepara tu cuenta aquí
+
+[13/05/2026 21:16:11] SMART SIGNALS: 🚨 ¿Aún estás confundido sobre cómo copiar las señales de la manera correcta?
+
+Muchas personas sienten lo mismo al principio. Lo importante es dar el primer paso 🚀
+
+Si has visto las señales pero todavía no entiendes completamente cómo copiarlas o ejecutarlas correctamente, hemos preparado algo especialmente para ti ✅
+
+➡️ Aprende ahora sin complicaciones y empieza a ganar con confianza paso a paso 💰📈
+
+No te quedes solo mirando cómo otros obtienen ganancias. Ahora es tu turno 🔥
+
+[13/05/2026 21:31:42] VIP TRADER A: 💵 USD/CAD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 21:35
+🔴 ABAJO
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 21:40
+2️⃣ MARTINGALA A LAS 21:45
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[13/05/2026 21:40:13] VIP TRADER A: VICTORIA DIRECTA ✅🤑
+

@@ -49,26 +49,25 @@ Usa `.env.example` como plantilla base.
 
 ---
 
-## Session Objective (modo automatico)
+## Money Management — Masaniello + Entry+G1
 
 | Variable                                  | Tipo      | Defecto    | Descripción |
 |-------------------------------------------|-----------|------------|-------------|
-| `APP_SESSION_MAX_MESSAGES`                | int       | `6`        | Máximo de mensajes por sesión automática |
-| `APP_SESSION_TARGET_PROFIT`               | float     | `10.0`     | Objetivo neto por sesión |
-| `APP_SESSION_TARGET_PROFIT_PER_WIN`       | float     | `5.0`      | Ganancia neta esperada por WIN para el cálculo de stake |
-| `APP_SESSION_STOP_LOSS_COUNT`             | int       | `3`        | Cierre de sesión por stop loss al alcanzar este número de losses |
-| `APP_PAYOUT_DEFAULT`                      | float     | `92`       | Payout fallback (%) cuando no se puede leer payout dinámico del broker |
+| `MASANIELLO_CAPITAL`                      | float     | `100.0`    | Capital inicial por ciclo |
+| `MASANIELLO_N`                            | int       | `10`       | Número de operaciones esperadas por ciclo |
+| `MASANIELLO_K`                            | int       | `7`        | Número de ganancias esperadas por ciclo (target ITM) |
+| `MASANIELLO_PAYOUT`                       | float     | `0.92`     | Payout del broker como decimal (0.85–0.95) |
+| `MASANIELLO_REINVERSION`                  | float     | `1.0`      | % de ganancias a reinvertir (0.0–1.0). 1.0 = 100% reinvestment |
+| `APP_SESSION_STOP_LOSS_PCT`               | float     | `0.20`     | Drawdown máximo permitido (20% = 0.20). Pausa sesión al alcanzarlo |
+| `APP_PAYOUT_DEFAULT`                      | float     | `92`       | Payout fallback (%) cuando no se puede leer dinámico del broker |
 | `POCKET_MIN_ORDER_AMOUNT`                 | float     | `1.0`      | Monto mínimo permitido para escribir en la UI del broker |
-| `APP_MASANIELLO_LOSS_BRAKE_ENABLED`       | bool      | `true`     | Activa freno progresivo por pérdidas recientes |
-| `APP_MASANIELLO_LOSS_BRAKE_WINDOW_MINUTES`| int       | `180`      | Ventana temporal para contar pérdidas recientes |
-| `APP_MASANIELLO_LOSS_BRAKE_STEP`          | float     | `0.25`     | Reducción del stake por cada pérdida dentro de la ventana |
-| `APP_MASANIELLO_LOSS_BRAKE_FLOOR`         | float     | `0.25`     | Piso mínimo del multiplicador de freno |
 
-Notas:
-- El modo automático actual usa SessionManager con objetivo por sesión (2 wins o 3 losses, máximo 6 mensajes).
-- `main.py` construye `SessionManager` usando `APP_SESSION_*`.
-- Fallback legacy: si `APP_SESSION_MAX_MESSAGES` no está definido, se usa `APP_MASANIELLO_N_OPS`; si `APP_SESSION_STOP_LOSS_COUNT` no está definido, se usa `APP_MASANIELLO_MAX_SESSION_LOSSES`.
-- `APP_MARTINGALE_MODE` y variables de `calculator` quedan como compatibilidad legacy, no como estrategia automática principal.
+**Notas importantes:**
+- **Motor Masaniello:** Calcula stake óptimo basado en table recursiva (backward-induction). Exact match del algoritmo de Excel.
+- **Splits Entry+G1:** Cada stake Masaniello se divide en Entry + Gale1 (usando `gale_factor`). Gale2 está **deshabilitado**.
+- **Stop Loss:** Sesión se pausa automáticamente cuando `capital_ciclo < capital_inicial_sesion × (1 - stop_loss_pct)`.
+- **Reinvestment:** 100% del capital se reinvierte hasta high-water mark; % de ganancias en exceso se reinvierte según `MASANIELLO_REINVERSION`.
+- **Persistencia:** Estado completo (stakes, capital, contadores) se persiste en `runtime/session_state.json` tras cada operación.
 
 ---
 

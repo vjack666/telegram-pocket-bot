@@ -105,9 +105,11 @@ class SignalEngine:
         self._session_base_max = max(1.0, float(session_base_max))
         self._scaling_anchor_balance: float | None = None
         self._ultimo_resultado: str | None = None
-        # Modo híbrido: freno de aprobación humana en G2
-        self._g2_human_approval = g2_human_approval
-        self._g2_approval_timeout_seconds = max(5, int(g2_approval_timeout_seconds))
+        # G2 queda formalmente deshabilitado para este flujo (solo ENTRADA + G1).
+        _ = g2_human_approval
+        _ = g2_approval_timeout_seconds
+        self._g2_human_approval = False
+        self._g2_approval_timeout_seconds = 0
         self._session_learning_db = session_learning_db
         self._operation_mode_schedule_enabled = bool(operation_mode_schedule_enabled)
         self._operation_mode_hybrid_start_hour = max(0, min(23, int(operation_mode_hybrid_start_hour)))
@@ -116,25 +118,10 @@ class SignalEngine:
         self._operation_mode_last: str | None = None
         # Estado del ciclo actual para aprendizaje
         self._cycle_sequence: str = ""         # "W", "L", "WL", "LL", etc.
-        self._cycle_g2_intervened: bool = False
-        self._cycle_g2_approved: bool | None = None
-        self._cycle_g2_amount: float | None = None
         # CRITICAL FIX: Broker-level lock to serialize all browser operations
         self._broker_lock = asyncio.Lock()
         
-        # Log inicial de configuración de modo operativo
-        if self._g2_human_approval:
-            ventana = f"{self._operation_mode_hybrid_start_hour:02d}:00 - {self._operation_mode_hybrid_end_hour:02d}:00 UTC-3"
-            logging.info(
-                "[MODO OPERATIVO] G2_HUMAN_APPROVAL=true | HIBRIDO=%s | AUTOMATICO=%s | "
-                "ventana_hibrido=%s | alerta_sonora=%s",
-                "✓" if self._operation_mode_schedule_enabled else "✗",
-                "✓" if self._operation_mode_schedule_enabled else "✗",
-                ventana,
-                "✓" if self._operation_mode_sound_alert else "✗",
-            )
-        else:
-            logging.info("[MODO OPERATIVO] G2_HUMAN_APPROVAL=false | Siempre AUTOMÁTICO (sin freno G2)")
+        logging.info("[MODO OPERATIVO] G2 deshabilitado: money management opera solo ENTRADA + G1")
 
         # Manual Operation Tracker — para registrar operaciones manuales del usuario
         self._manual_operation_tracker = manual_operation_tracker
@@ -395,6 +382,26 @@ class SignalEngine:
     def _apply_broker_amount_floor(self, amount: float) -> float:
         return round(max(self._pocket_min_order_amount, float(amount)), 2)
 
+    async def _inject_next_stake_post_result(self) -> None:
+        """Escribe en la caja del broker el próximo stake según Masaniello,
+        inmediatamente tras conocer el resultado (WIN o LOSS).
+        Garantiza que la caja siempre quede lista para la siguiente señal."""
+        if self._session_manager is None:
+            return
+        try:
+            next_amount = self._apply_broker_amount_floor(
+                self._session_manager.get_stakes_para_senal(self._pocket_min_order_amount)["entry"]
+            )
+            await self._pocket_client.set_amount(next_amount, max_retries=2)
+            logging.info(
+                "[PostResult] ✅ Próximo stake inyectado en broker: $%.2f",
+                next_amount,
+            )
+        except Exception as exc:
+            logging.warning(
+                "[PostResult] ⚠️  No se pudo escribir próximo stake en broker: %s", exc
+            )
+
     def _sync_session_loss_from_global(self) -> None:
         if self._session_manager is None:
             return
@@ -429,14 +436,22 @@ class SignalEngine:
         if self._session_manager is None:
             return
 
-        result_label = self._session_result_label(step_name, won)
-        debt_after_loss = self._global_gale.accumulated_loss if not won else None
-        status = self._session_manager.update_session_status(
-            result_label,
-            debt_after_loss=debt_after_loss,
-            current_balance=self._last_known_balance,
-        )
-        if status.get("stop_triggered"):
+        normalized_step = str(step_name).strip().upper()
+        if normalized_step == "ENTRADA":
+            status = self._session_manager.registrar_resultado_senal(
+                "WIN" if won else "LOSS",
+                None if won else "LOSS",
+            )
+        elif normalized_step == "MARTINGALA 1":
+            status = self._session_manager.registrar_resultado_senal(
+                "LOSS",
+                "WIN" if won else "LOSS",
+            )
+        else:
+            # G2 ya no forma parte del money management de sesión.
+            return
+
+        if status.get("sesion_pausada"):
             self._alert_session_stop_loss()
 
     async def _prefill_manual_loss_amount(self, pending_manual: dict[str, Any]) -> None:
@@ -447,13 +462,16 @@ class SignalEngine:
             return
 
         try:
-            next_if_loss = float(self._session_manager.peek_next_stake_if_loss())
+            next_if_loss = float(
+                self._session_manager.peek_next_stake_if_loss(
+                    min_order=self._pocket_min_order_amount
+                )
+            )
         except Exception as exc:
             logging.debug("[BalanceMonitor] No se pudo previsualizar stake post-loss manual: %s", exc)
             return
 
-        multiplier = self._loss_brake_multiplier()
-        adjusted_next_if_loss = self._apply_broker_amount_floor(next_if_loss * multiplier)
+        adjusted_next_if_loss = self._apply_broker_amount_floor(next_if_loss)
 
         if adjusted_next_if_loss <= 0:
             return
@@ -463,12 +481,8 @@ class SignalEngine:
             pending_manual["prefill_loss_written"] = True
             pending_manual["prefill_loss_amount"] = adjusted_next_if_loss
             logging.info(
-                "[BalanceMonitor] Prefill manual (si pierde) escrito: $%.2f "
-                "(raw=%.2f, mult=%.2f, losses_3h=%d)",
+                "[BalanceMonitor] Prefill manual (si pierde) escrito: $%.2f",
                 adjusted_next_if_loss,
-                next_if_loss,
-                multiplier,
-                len(self._recent_cycle_loss_times),
             )
         except Exception as exc:
             logging.warning(
@@ -620,7 +634,7 @@ class SignalEngine:
         # ─────────────────────────────────────────────────────────────────────
         if self._session_manager is not None:
             try:
-                next_amount = self._session_manager.get_next_stake(self._pocket_min_order_amount)
+                next_amount = self._session_manager.get_stakes_para_senal(self._pocket_min_order_amount)["entry"]
                 await self._pocket_client.set_amount(next_amount, max_retries=2)
                 logging.info(
                     "[BalanceMonitor] 💰 Siguiente monto SessionManager escrito: $%.2f "
@@ -657,7 +671,7 @@ class SignalEngine:
                 "wins": self._session_manager.wins if self._session_manager else None,
                 "losses": self._session_manager.losses if self._session_manager else None,
                 "signals_consumed": self._session_manager.signals_consumed if self._session_manager else None,
-                "is_session_blocked": self._session_manager.session_blocked if self._session_manager else None,
+                "is_session_blocked": self._session_manager.sesion_pausada if self._session_manager else None,
             } if self._session_manager else None,
         )
         
@@ -679,7 +693,7 @@ class SignalEngine:
             self._bot_trade_in_progress = False
 
     async def _run_martingale_flow(self, signal: TradingSignal) -> None:
-        if self._session_manager is not None and self._session_manager.global_stop:
+        if self._session_manager is not None and self._session_manager.sesion_pausada:
             self._alert_session_stop_loss()
             self._emit_event(
                 "global_stop_active",
@@ -705,9 +719,6 @@ class SignalEngine:
         
         # Resetear estado de aprendizaje del ciclo
         self._cycle_sequence = ""
-        self._cycle_g2_intervened = False
-        self._cycle_g2_approved = None
-        self._cycle_g2_amount = None
         logging.info(
             "Nueva señal inicia en ENTRADA (step=0) | balance=%.2f accumulated_loss=%.2f target=%.2f | "
             "inherit_manual_loss=%s",
@@ -718,6 +729,16 @@ class SignalEngine:
         )
         
         cycle_amounts = self._build_cycle_amounts(before_cycle_balance)
+        if not cycle_amounts:
+            logging.warning(
+                "Señal omitida: SessionManager indicó sesión pausada o sin montos válidos."
+            )
+            self._emit_event(
+                "signal_skipped_session_paused",
+                asset=signal.asset,
+                side=signal.side,
+            )
+            return
         entry_times = self._build_schedule(signal, len(cycle_amounts))
         self._print_waiting_summary(signal, entry_times, cycle_amounts)
         self._emit_event(
@@ -789,9 +810,9 @@ class SignalEngine:
             session_sequence=seq,
             session_label=label,
             step_reached=step_reached,
-            g2_intervened=self._cycle_g2_intervened,
-            g2_approved=self._cycle_g2_approved,
-            g2_amount=self._cycle_g2_amount,
+            g2_intervened=False,
+            g2_approved=None,
+            g2_amount=None,
             session_pnl=session_pnl,
             won=won,
             expiry_minutes=signal.expiry_minutes,
@@ -934,6 +955,8 @@ class SignalEngine:
                     amount,
                     color_output=self._color_output,
                 )
+                # Inyectar próximo stake en broker inmediatamente tras WIN
+                await self._inject_next_stake_post_result()
                 # Watchdog: escaneo post-trade con delay de 5s
                 if self._watchdog_trigger is not None:
                     self._watchdog_trigger()
@@ -975,6 +998,8 @@ class SignalEngine:
                     amount,
                     color_output=self._color_output,
                 )
+                # Inyectar próximo stake en broker inmediatamente tras LOSS final
+                await self._inject_next_stake_post_result()
                 # Watchdog: escaneo post-trade con delay de 5s
                 if self._watchdog_trigger is not None:
                     self._watchdog_trigger()
@@ -1208,6 +1233,8 @@ class SignalEngine:
                 next_amount,
                 color_output=self._color_output,
             )
+            # Inyectar próximo stake en broker inmediatamente tras WIN intermedio
+            await self._inject_next_stake_post_result()
             return None
 
         logging.info("%s cerro en LOSS. Continuando con %s.", current_step_name, next_step_name)
@@ -1343,20 +1370,6 @@ class SignalEngine:
             except Exception as exc:
                 logging.debug("Error sonoro en cambio de modo: %s", exc)
         return mode
-
-    def _should_request_g2_approval(self, signal: TradingSignal | None = None, refresh_mode: bool = False) -> bool:
-        mode = self._refresh_operation_mode(signal) if refresh_mode else (self._operation_mode_last or self._current_operation_mode(signal))
-        return mode == "HIBRIDO"
-
-    async def _request_g2_approval(self, signal: TradingSignal, amount: float) -> bool:
-        """Compatibilidad sin prompts: G2 se aprueba automáticamente."""
-        logging.info(
-            "[HÍBRIDO] Aprobación G2 automática (sin prompt). Activo=%s Dirección=%s Monto=%.2f",
-            signal.asset,
-            signal.side,
-            amount,
-        )
-        return True
 
     async def _click_prepared_step_immediate(
         self,
@@ -1807,7 +1820,7 @@ class SignalEngine:
             asset or "N/A",
         )
         if self._session_manager is not None:
-            self._session_manager.update_payout_mult(1.0 + payout_net)
+            self._session_manager.update_payout(payout_net)
 
     def _print_waiting_summary(
         self,
@@ -1915,15 +1928,12 @@ class SignalEngine:
     def _build_cycle_amounts(self, current_balance: float) -> list[float]:
         if self._session_manager is not None:
             self._sync_session_loss_from_global()
-            if self._session_manager.session_blocked:
+            if self._session_manager.sesion_pausada:
                 logging.warning(
-                    "SessionManager bloqueado por guard de pérdidas. "
-                    "Usando amounts cero para skip de senial. "
-                    "El bloqueo se libera en el proximo WIN."
+                    "SessionManager pausado por stop-loss de sesión. "
+                    "No se construirá plan de montos para esta señal."
                 )
-                # Devuelve stakes minimos: el engine los ejecutara pero seran $0.01 (dry-safe).
-                # Esto preserva el pipeline de timing intacto; el riesgo financiero es nulo.
-                return [0.01, 0.01, 0.01]
+                return []
             return self._session_amounts()
         return list(self._martingale_amounts)
 
@@ -1932,40 +1942,17 @@ class SignalEngine:
         return
 
     def _session_amounts(self) -> list[float]:
-        """Calcula [entry, G1, G2] exclusivamente desde SessionManager."""
+        """Calcula [entry, G1] exclusivamente desde SessionManager."""
         assert self._session_manager is not None
 
-        if hasattr(self._session_manager, "should_use_recovery_sequence") and self._session_manager.should_use_recovery_sequence():
-            flat = self._apply_broker_amount_floor(float(self._session_manager.recovery_stake))
-            amounts = [flat, flat, flat]
-            logging.info(
-                "Recuperacion activa: usando secuencia plana especial %s | "
-                "deuda=%.2f max_hist=%.2f balance=%.2f objetivo=%.2f",
-                amounts,
-                float(getattr(self._session_manager, "deuda_acumulada", 0.0)),
-                float(getattr(self._session_manager, "balance_maximo_historico", 0.0)),
-                float(getattr(self._session_manager, "balance_actual", 0.0)),
-                float(getattr(self._session_manager, "balance_objetivo_recuperacion", 0.0)),
-            )
-            return amounts
+        stakes = self._session_manager.get_stakes_para_senal(self._pocket_min_order_amount)
+        entry = self._apply_broker_amount_floor(stakes["entry"])
+        g1_amount = self._apply_broker_amount_floor(stakes["g1"])
 
-        base_entry = self._session_manager.get_next_stake(self._pocket_min_order_amount)
-
-        g1_mult = max(1.0, float(self._recovery_profile.g1_mult))
-        g2_mult = max(g1_mult, float(self._recovery_profile.g2_mult))
-
-        entry = self._apply_broker_amount_floor(base_entry)
-        g1_amount = self._apply_broker_amount_floor(base_entry * g1_mult)
-        g2_amount = self._apply_broker_amount_floor(base_entry * g2_mult)
-
-        amounts = [
-            entry,
-            g1_amount,
-            g2_amount,
-        ]
+        amounts = [entry, g1_amount]
         logging.info(
             "Sesion %d/%d: señal %d/%d wins=%d losses=%d "
-            "base=%.2f g1_mult=%.4f g2_mult=%.4f amounts=%s",
+            "entry=%.2f g1=%.2f max_riesgo=%.2f amounts=%s",
             self._session_manager.n_ops,
             self._session_manager.w_needed,
             self._session_manager.signals_consumed + 1,
@@ -1973,8 +1960,8 @@ class SignalEngine:
             self._session_manager.wins,
             self._session_manager.losses,
             entry,
-            g1_mult,
-            g2_mult,
+            g1_amount,
+            float(stakes["max_riesgo"]),
             amounts,
         )
         return amounts

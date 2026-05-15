@@ -28,12 +28,13 @@ class SessionStatePersistence:
             logging.warning("[SessionPersist] No se pudo leer estado: %s", exc)
             return {"loaded": False, "reason": "read_error"}
 
-        state = data.get("state", {})
+        # Soporta formato nuevo (payload directo) y legacy (wrapper con "state").
+        state = data.get("state", data)
         session.restore_state(state, notify=False)
         return {
             "loaded": True,
             "reason": "ok",
-            "saved_at": data.get("saved_at_utc", ""),
+            "saved_at": data.get("timestamp_ultima_actualizacion", data.get("saved_at_utc", "")),
         }
 
     def save_session(self, session: SessionManager, reason: str = "state_change") -> None:
@@ -42,12 +43,8 @@ class SessionStatePersistence:
     def save_snapshot(self, state: dict[str, Any], reason: str = "state_change") -> None:
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            now_utc = datetime.now(timezone.utc)
-            payload = {
-                "saved_at_utc": now_utc.isoformat(),
-                "reason": reason,
-                "state": state,
-            }
+            payload = dict(state)
+            payload["timestamp_ultima_actualizacion"] = datetime.now(timezone.utc).isoformat()
             self._state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception as exc:
             logging.error("[SessionPersist] No se pudo guardar estado: %s", exc)

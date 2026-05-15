@@ -30,6 +30,7 @@ from src.core.manual_operation_cli import ManualOperationCLI
 from src.core.session_state_persistence import SessionStatePersistence
 from src.strategies.manual_strategies import MasanielloSessionState
 from src.pocket_option.client import PocketOptionDemoClient
+from scripts.vision_sr_fib_filter import VisionFilterGate, VisionGatedExecutionEngine
 from src.utils.blackbox import DeferredBlackBoxRecorder, ShutdownSnapshot
 from src.utils.session_learning_db import SessionLearningDB
 from src.utils.logger import setup_logging
@@ -243,6 +244,7 @@ async def run() -> None:
         amount_selector=settings.pocket_amount_selector,
     )
     worker_tasks: list[asyncio.Task] = []
+    vision_gate: VisionFilterGate | None = None
     completed_cleanly = False
     try:
         _set_run_phase("starting_browser")
@@ -382,24 +384,58 @@ async def run() -> None:
             return
 
         session_manager = SessionManager(
-            max_messages_per_session=settings.session_max_messages,
-            target_profit_session=settings.session_target_profit,
-            target_profit_per_win=settings.session_target_profit_per_win,
-            stop_loss_count=settings.session_stop_loss_count,
+            capital=settings.masaniello_capital,
+            n=settings.masaniello_n,
+            k=settings.masaniello_k,
             payout=runtime_payout_percent / 100.0,
+            reinversion_pct=settings.masaniello_reinversion,
+            stop_loss_pct=settings.session_stop_loss_pct,
         )
         logging.info(
-            "[SessionConfig] msgs=%d target=%.2f target_win=%.2f stop_loss=%d payout=%.2f%%",
-            settings.session_max_messages,
-            settings.session_target_profit,
-            settings.session_target_profit_per_win,
-            settings.session_stop_loss_count,
+            "[SessionConfig] capital=%.2f n=%d k=%d reinversion=%.2f stop_loss_pct=%.2f payout=%.2f%%",
+            settings.masaniello_capital,
+            settings.masaniello_n,
+            settings.masaniello_k,
+            settings.masaniello_reinversion,
+            settings.session_stop_loss_pct,
             runtime_payout_percent,
         )
 
         session_state_path = _RUNTIME_BASE_DIR / "session_state.json"
         session_persistence = SessionStatePersistence(str(session_state_path))
-        load_info = session_persistence.load_into_session(session_manager)
+        restore_session_on_startup = os.getenv("APP_SESSION_RESTORE_ENABLED", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if restore_session_on_startup:
+            load_info = session_persistence.load_into_session(session_manager)
+        else:
+            load_info = {
+                "loaded": False,
+                "reason": "restore_disabled",
+            }
+            logging.info(
+                "[SessionPersist] Restauracion desactivada por APP_SESSION_RESTORE_ENABLED=false. "
+                "Se iniciara sesion limpia."
+            )
+        clear_stale_stop_on_startup = os.getenv("APP_CLEAR_STALE_STOP_ON_STARTUP", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if load_info.get("loaded") and clear_stale_stop_on_startup and session_manager.sesion_pausada:
+            session_manager.reset_session(reason="startup_clear_stale_stop", notify=False, clear_stop_flags=True)
+            load_info = {
+                "loaded": False,
+                "reason": "startup_clear_stale_stop",
+            }
+            logging.warning(
+                "[SessionPersist] Sesion pausada restaurada desde disco. "
+                "Se libera automaticamente en arranque (APP_CLEAR_STALE_STOP_ON_STARTUP=true)."
+            )
         session_save_task: asyncio.Task | None = None
         pending_reason: str | None = None
 
@@ -562,8 +598,22 @@ async def run() -> None:
             session_loss_brake_step=settings.masaniello_loss_brake_step,
             session_loss_brake_floor=settings.masaniello_loss_brake_floor,
         )
+
+        vision_gate = VisionFilterGate.from_env(pocket_client=pocket_client)
+        execution_engine: Any = VisionGatedExecutionEngine(
+            base_engine=engine,
+            pocket_client=pocket_client,
+            gate=vision_gate,
+        )
+        logging.info(
+            "[VisionFilter] estado=%s | timeout=%ss | screenshot_delay=%ss",
+            os.getenv("VISION_FILTER", "false"),
+            os.getenv("VISION_TIMEOUT", "15"),
+            os.getenv("VISION_SCREENSHOT_DELAY", "3"),
+        )
+
         # ── Escribir monto inicial sugerido por SessionManager en el broker ──
-        _startup_amount = session_manager.get_next_stake(settings.pocket_min_order_amount)
+        _startup_amount = session_manager.get_stakes_para_senal(settings.pocket_min_order_amount)["entry"]
         if _startup_amount and _startup_amount > 0:
             try:
                 await pocket_client.set_amount(_startup_amount, max_retries=3)
@@ -574,7 +624,7 @@ async def run() -> None:
         processor = SignalProcessor(
             message_queue=message_queue,
             parser=parser,
-            execution_engine=engine,
+            execution_engine=execution_engine,
             state_manager=state_manager,
             late_tolerance_seconds=settings.signal_late_tolerance_seconds,
             busy_policy=settings.busy_policy,
@@ -770,6 +820,8 @@ async def run() -> None:
                 elapsed_seconds=round(elapsed_seconds, 3),
                 lifecycle=snapshot,
             )
+            if vision_gate is not None:
+                await vision_gate.close()
         else:
             logging.info(
                 "Cerrando navegador (shutdown_reason=%s, phase=%s, elapsed=%.2fs)",
@@ -784,6 +836,8 @@ async def run() -> None:
                 elapsed_seconds=round(elapsed_seconds, 3),
                 lifecycle=snapshot,
             )
+            if vision_gate is not None:
+                await vision_gate.close()
             await pocket_client.close()
             _blackbox.record("pocket_close_done", component="pocket_client")
 

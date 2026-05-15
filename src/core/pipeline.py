@@ -373,53 +373,64 @@ class SignalProcessor:
                 my_rank = self._channel_priority.get(chat_id, 99)
                 await self._wait_for_priority_turn(chat_id, my_rank)
 
-                async with self._execution_lock:
-                    logging.info(
-                        "Iniciando control de entrada canal='%s' asset=%s",
-                        channel_name,
-                        item.signal.asset,
-                    )
-                    await self._run_signal_task(item)
+                logging.info(
+                    "Iniciando control de entrada canal='%s' asset=%s",
+                    channel_name,
+                    item.signal.asset,
+                )
+                await self._run_signal_task(item)
             finally:
                 queue.task_done()
 
     async def _run_signal_task(self, item: QueuedSignal) -> None:
-        self._state_manager.inc_active()
-        # CRITICAL FIX: Mark channel as active (atomic) to prevent simultaneous signals from same channel
-        await self._state_manager.mark_channel_active(item.envelope.chat_id)
-        logging.info(
-            "[PARALELO] Iniciando señal canal='%s' asset=%s side=%s activas=%d",
-            item.envelope.source_name or str(item.envelope.chat_id),
-            item.signal.asset,
-            item.signal.side,
-            self._state_manager.active_count,
-        )
-        try:
-            await self._execution_engine.execute_signal(item.signal)
-        except RuntimeError as exc:
-            message = str(exc)
-            if (
-                "cancelada por desalineacion de activo" in message
-                or "cancelada" in message
-                or "ignorada" in message
-            ):
-                self._emit_event(
-                    "trade_signal_cancelled",
-                    channel=item.envelope.source_name or str(item.envelope.chat_id),
-                    message_id=item.envelope.message_id,
-                    asset=item.signal.asset,
-                    side=item.signal.side,
-                    reason=message,
-                )
-                logging.warning(
-                    "Senal cancelada canal='%s' msg_id=%s motivo=%s",
-                    item.envelope.source_name or str(item.envelope.chat_id),
-                    item.envelope.message_id,
-                    message,
-                )
-                # Cancelaciones esperables (entrada vencida, desalineacion, etc.)
-                # NO deben tumbar todo el runtime ni forzar reinicio de navegador.
-            else:
+        async with self._execution_lock:
+            self._state_manager.inc_active()
+            # CRITICAL FIX: Mark channel as active (atomic) to prevent simultaneous signals from same channel
+            await self._state_manager.mark_channel_active(item.envelope.chat_id)
+            logging.info(
+                "[SERIAL] Ejecutando señal canal='%s' asset=%s side=%s activas=%d",
+                item.envelope.source_name or str(item.envelope.chat_id),
+                item.signal.asset,
+                item.signal.side,
+                self._state_manager.active_count,
+            )
+            try:
+                await self._execution_engine.execute_signal(item.signal)
+            except RuntimeError as exc:
+                message = str(exc)
+                if (
+                    "cancelada por desalineacion de activo" in message
+                    or "cancelada" in message
+                    or "ignorada" in message
+                ):
+                    self._emit_event(
+                        "trade_signal_cancelled",
+                        channel=item.envelope.source_name or str(item.envelope.chat_id),
+                        message_id=item.envelope.message_id,
+                        asset=item.signal.asset,
+                        side=item.signal.side,
+                        reason=message,
+                    )
+                    logging.warning(
+                        "Senal cancelada canal='%s' msg_id=%s motivo=%s",
+                        item.envelope.source_name or str(item.envelope.chat_id),
+                        item.envelope.message_id,
+                        message,
+                    )
+                    # Cancelaciones esperables (entrada vencida, desalineacion, etc.)
+                    # NO deben tumbar todo el runtime ni forzar reinicio de navegador.
+                else:
+                    logging.exception(
+                        "Error en ejecucion de señal canal='%s' msg_id=%s: %s",
+                        item.envelope.source_name or str(item.envelope.chat_id),
+                        item.envelope.message_id,
+                        exc,
+                    )
+                    self._request_restart(
+                        f"RuntimeError en ejecucion de señal canal={item.envelope.source_name or item.envelope.chat_id} "
+                        f"msg_id={item.envelope.message_id}: {message}"
+                    )
+            except Exception as exc:
                 logging.exception(
                     "Error en ejecucion de señal canal='%s' msg_id=%s: %s",
                     item.envelope.source_name or str(item.envelope.chat_id),
@@ -427,24 +438,13 @@ class SignalProcessor:
                     exc,
                 )
                 self._request_restart(
-                    f"RuntimeError en ejecucion de señal canal={item.envelope.source_name or item.envelope.chat_id} "
-                    f"msg_id={item.envelope.message_id}: {message}"
+                    f"Exception en ejecucion de señal canal={item.envelope.source_name or item.envelope.chat_id} "
+                    f"msg_id={item.envelope.message_id}: {type(exc).__name__}: {exc}"
                 )
-        except Exception as exc:
-            logging.exception(
-                "Error en ejecucion de señal canal='%s' msg_id=%s: %s",
-                item.envelope.source_name or str(item.envelope.chat_id),
-                item.envelope.message_id,
-                exc,
-            )
-            self._request_restart(
-                f"Exception en ejecucion de señal canal={item.envelope.source_name or item.envelope.chat_id} "
-                f"msg_id={item.envelope.message_id}: {type(exc).__name__}: {exc}"
-            )
-        finally:
-            self._state_manager.dec_active()
-            # CRITICAL FIX: Unmark channel when execution completes (atomic)
-            await self._state_manager.mark_channel_inactive(item.envelope.chat_id)
+            finally:
+                self._state_manager.dec_active()
+                # CRITICAL FIX: Unmark channel when execution completes (atomic)
+                await self._state_manager.mark_channel_inactive(item.envelope.chat_id)
 
     async def _process_envelope(self, envelope: TelegramInboundMessage) -> None:
         now_utc = datetime.now(timezone.utc)
