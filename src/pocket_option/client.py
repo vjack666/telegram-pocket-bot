@@ -73,6 +73,9 @@ class PocketOptionBaseClient(ABC):
     async def get_configured_expiry_seconds(self) -> int | None:
         return None
 
+    def execute_orders_enabled(self) -> bool:
+        return True
+
 
 class PocketOptionDemoClient(PocketOptionBaseClient):
     def __init__(
@@ -92,9 +95,12 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
         sell_selector: str = "",
         amount_selector: str = "",
     ) -> None:
-        self._account_mode = account_mode
+        self._account_mode = (account_mode or "demo").strip().lower()
+        if self._account_mode not in {"demo", "real"}:
+            self._account_mode = "demo"
         self._default_asset = default_asset
         self._demo_url = demo_url
+        self._trading_url = self._resolve_trading_url(self._account_mode, self._demo_url)
         self._profile_dir = profile_dir
         self._headless = headless
         self._execute_orders = execute_orders
@@ -120,6 +126,33 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
         self._last_logged_balance: float | None = None  # suprimir spam de log cuando saldo no cambia
         self._candle_feed = CandleFeed()
         self._trade_panel_feed = TradePanelFeed()
+
+    def execute_orders_enabled(self) -> bool:
+        return bool(self._execute_orders)
+
+    @staticmethod
+    def _resolve_trading_url(account_mode: str, configured_url: str) -> str:
+        mode = (account_mode or "demo").strip().lower()
+        raw = (configured_url or "").strip()
+
+        demo_default = "https://pocketoption.com/en/cabinet/demo-quick-high-low/"
+        real_default = "https://pocketoption.com/en/cabinet/quick-high-low/"
+
+        if mode == "real":
+            if "demo-quick-high-low" in raw:
+                return raw.replace("demo-quick-high-low", "quick-high-low")
+            if "quick-high-low" in raw:
+                return raw
+            return real_default
+
+        # demo
+        if not raw:
+            return demo_default
+        if "demo-quick-high-low" in raw:
+            return raw
+        if "quick-high-low" in raw:
+            return raw.replace("quick-high-low", "demo-quick-high-low")
+        return raw
 
     async def connect(self) -> None:
         async with self._state_lock:
@@ -168,7 +201,7 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
                             attempt, str(exc)[:300],
                         )
 
-                        if _is_profile_in_use_error(exc) and attempt < max_profile_open_retries:
+                        if (_is_profile_in_use_error(exc) or _is_target_closed_error(exc)) and attempt < max_profile_open_retries:
                             # Si el perfil principal parece bloqueado, migrar a un perfil alterno limpio.
                             if (
                                 active_profile_path == primary_profile_path
@@ -204,9 +237,14 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
                 )
                 await self._apply_stealth_basics()
                 await self._goto_with_retries(
-                    self._demo_url,
+                    self._trading_url,
                     max_attempts=4,
                     timeout_ms=60000,
+                )
+                logging.info(
+                    "Pocket Option URL aplicada para modo=%s: %s",
+                    self._account_mode,
+                    self._trading_url,
                 )
                 self._candle_feed.attach(self._page)
                 self._is_running = True
@@ -395,23 +433,29 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
         }
         await self.connect()
 
+        async def _do_prepare() -> None:
+            await self.ensure_asset(payload["asset"], max_attempts=3)
+            if self._execute_orders:
+                await self._set_expiry_minutes(signal.expiry_minutes, max_retries=3)
+            await self._set_amount(signal.amount, max_retries=3)
+
+        await self._run_with_browser_ui_lock("place_order_prepare", _do_prepare)
+
         if not self._execute_orders:
-            logging.info("[DEMO] Orden preparada para Pocket Option (simulada): %s", payload)
+            logging.info(
+                "[MANUAL] Orden preparada sin click automático (asset+monto listos; expiración sin cambios): %s",
+                payload,
+            )
             return
 
-        async def _do_place() -> None:
-            await self.ensure_asset(payload["asset"], max_attempts=3)
-            await self._set_expiry_minutes(signal.expiry_minutes, max_retries=3)
-            await self._set_amount(signal.amount, max_retries=3)
+        async def _do_click() -> None:
             await self._click_side(signal.side, max_retries=3)
 
-        await self._run_with_browser_ui_lock("place_order", _do_place)
+        await self._run_with_browser_ui_lock("place_order_click", _do_click)
         logging.info("Orden enviada a Pocket Option: %s", payload)
 
     async def set_amount(self, amount: float, max_retries: int = 3) -> None:
         """Escribe el monto en el campo amount del broker (sin cambiar asset ni expiración)."""
-        if not self._execute_orders:
-            return
         await self._set_amount(amount, max_retries=max_retries)
 
     async def prepare_order_for_execution(
@@ -424,33 +468,48 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
         """Fase 1: setup durante el countdown (cambiar asset + poner monto).
         Llamar durante _run_countdown() para que en segundo 0 solo se clickee.
         """
-        if not self._execute_orders:
-            return
-
-        logging.info(
-            "━━━ Preparando orden: %s | Exp: %sm | Monto: $%.2f ━━━",
-            asset,
-            expiry_minutes,
-            amount,
-        )
+        if self._execute_orders:
+            logging.info(
+                "━━━ Preparando orden: %s | Exp: %sm | Monto: $%.2f ━━━",
+                asset,
+                expiry_minutes,
+                amount,
+            )
+        else:
+            logging.info(
+                "━━━ Preparando orden manual: %s | Monto: $%.2f (expiración sin cambios) ━━━",
+                asset,
+                amount,
+            )
         async def _do_prepare() -> None:
             await self.ensure_asset(asset, max_attempts=max_retries)
-            await self._set_expiry_minutes(expiry_minutes, max_retries=max_retries)
+            if self._execute_orders:
+                await self._set_expiry_minutes(expiry_minutes, max_retries=max_retries)
             await self._set_amount(amount, max_retries=max_retries)
 
         await self._run_with_browser_ui_lock("prepare_order_for_execution", _do_prepare)
-        logging.info(
-            "✓ Orden lista: asset=%s exp=%sm monto=$%.2f (listo para clickear)",
-            asset,
-            expiry_minutes,
-            amount,
-        )
+        # Cierre defensivo: deja la gráfica libre aunque el foco quede en el input.
+        await self._send_escape_after_stake()
+        if self._execute_orders:
+            logging.info(
+                "✓ Orden lista: asset=%s exp=%sm monto=$%.2f (listo para clickear)",
+                asset,
+                expiry_minutes,
+                amount,
+            )
+        else:
+            logging.info(
+                "✓ Orden manual lista: asset=%s monto=$%.2f (sin tocar expiración)",
+                asset,
+                amount,
+            )
 
     async def execute_order_click(self, side: str) -> None:
         """Fase 2: ejecutar orden con un click instantáneo en segundo 0.
         Llamar cuando timestamp llega a hh:mm:00.
         """
         if not self._execute_orders:
+            logging.info("[MANUAL] Click automático omitido (%s).", side)
             return
 
         async def _do_click() -> None:
@@ -973,7 +1032,12 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
             for idx in range(min(count, 8)):
                 raw_text = (await locator.nth(idx).inner_text()).strip()
                 for value in _extract_numbers(raw_text):
-                    score = _score_balance_candidate(raw_text, selector, value)
+                    score = _score_balance_candidate(
+                        raw_text,
+                        selector,
+                        value,
+                        account_mode=self._account_mode,
+                    )
                     if score > 0:
                         candidates.append((score, value, raw_text, selector))
 
@@ -991,7 +1055,12 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
 
         for item in balance_like_texts:
             for value in _extract_numbers(item):
-                score = _score_balance_candidate(item, "dom-balance-like", value)
+                score = _score_balance_candidate(
+                    item,
+                    "dom-balance-like",
+                    value,
+                    account_mode=self._account_mode,
+                )
                 if score > 0:
                     candidates.append((score, value, item, "dom-balance-like"))
 
@@ -1028,11 +1097,8 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
         for attempt in range(1, attempts + 1):
             try:
                 await self._set_amount_once(amount_text)
-                # Dejar la gráfica libre tras escribir el monto (cerrar foco/cualquier popover).
-                try:
-                    await self._page.keyboard.press("Escape")
-                except Exception:
-                    pass
+                # Regla operativa: cada vez que se coloca stake, enviar Escape.
+                await self._send_escape_after_stake()
                 logging.info(
                     "✓ Monto inyectado correctamente: $%.2f (intento %d/%d) | Escape enviado",
                     amount,
@@ -1041,6 +1107,8 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
                 )
                 return
             except Exception as exc:
+                # Aun en fallo, limpiar foco/popovers para el próximo intento.
+                await self._send_escape_after_stake()
                 last_error = exc
                 logging.warning(
                     "⚠ Intento %d/%d de inyectar monto $%.2f falló: %s",
@@ -1053,6 +1121,15 @@ class PocketOptionDemoClient(PocketOptionBaseClient):
                     await asyncio.sleep(0.5)
 
         raise RuntimeError(f"No se pudo inyectar monto {amount_text}: {last_error}")
+
+    async def _send_escape_after_stake(self) -> None:
+        """Envía Escape de forma segura para liberar foco del input/teclado virtual."""
+        if self._page is None:
+            return
+        try:
+            await self._page.keyboard.press("Escape")
+        except Exception:
+            pass
 
     async def _set_expiry_minutes(self, expiry_minutes: int, max_retries: int = 3) -> None:
         if self._page is None:
@@ -1443,7 +1520,12 @@ def _parse_number_token(token: str) -> float | None:
         return None
 
 
-def _score_balance_candidate(raw_text: str, selector: str, value: float) -> int:
+def _score_balance_candidate(
+    raw_text: str,
+    selector: str,
+    value: float,
+    account_mode: str = "demo",
+) -> int:
     score = 0
     text = raw_text.lower()
     sel = selector.lower()
@@ -1459,6 +1541,17 @@ def _score_balance_candidate(raw_text: str, selector: str, value: float) -> int:
         score += 30
     if "balance" in text or "saldo" in text or "demo" in text:
         score += 20
+    mode = (account_mode or "demo").strip().lower()
+    if mode == "real":
+        if "demo" in compact or "practice" in compact:
+            score -= 120
+        if "real" in compact or "live" in compact or "saldo real" in compact:
+            score += 80
+    else:
+        if "demo" in compact or "practice" in compact:
+            score += 25
+        if "real" in compact or "live" in compact:
+            score -= 40
     if "%" in raw_text:
         score -= 40
     if value >= 100:

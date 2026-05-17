@@ -16,11 +16,12 @@ from src.pocket_option.assets import canonicalize_pocket_asset, normalize_asset_
 from src.pocket_option.client import PocketOptionBaseClient
 from src.pocket_option.trade_panel_feed import LiveTradeSnapshot
 from src.core.session_manager import SessionManager
-from src.core.recovery_profile import RecoveryProfile
+
 from src.core.equity_bands import EquityBandManager
 from src.core.daily_profit_tracker import DailyProfitTracker
 from src.utils.session_learning_db import SessionLearningDB
 from src.core.manual_operation_tracker import ManualOperationTracker
+from src.utils.payout_guard import check_payout_or_notify
 
 
 class SignalEngine:
@@ -39,7 +40,7 @@ class SignalEngine:
         signal_late_tolerance_seconds: int,
         global_gale_state: Any,
         session_manager: SessionManager | None = None,
-        recovery_profile: RecoveryProfile | None = None,
+        recovery_profile = None,
         calc_base_balance: float = 300.0,
         event_recorder: Callable[..., None] | None = None,
         equity_manager: Optional[EquityBandManager] = None,
@@ -62,6 +63,7 @@ class SignalEngine:
         session_loss_brake_window_minutes: int = 180,
         session_loss_brake_step: float = 0.25,
         session_loss_brake_floor: float = 0.25,
+        payout_min_profitable: float = 0.80,
     ) -> None:
         self._pocket_client = pocket_client
         self._martingale_amounts = [value for value in martingale_amounts if value > 0] or [2.0, 4.0, 10.0]
@@ -80,17 +82,8 @@ class SignalEngine:
         self._martingale_send_lead_seconds = 0.2
         self._max_entry_delay_seconds = 10.0
         self._calc_base_balance = max(1.0, calc_base_balance)
-        # RecoveryProfile: si no se pasa uno, construir defaults seguros desde payout
-        if recovery_profile is None:
-            full_pm = 1.0 + self._calc_payout
-            auto_g1 = round(full_pm / self._calc_payout, 4)
-            recovery_profile = RecoveryProfile(
-                g1_mult=auto_g1,
-                g2_mult=round(auto_g1 * auto_g1, 4),
-                max_trade_pct=0.10,
-                max_total_exposure_pct=0.25,
-            )
-        self._recovery_profile = recovery_profile
+        # RecoveryProfile eliminado temporalmente
+        self._recovery_profile = None
         self._global_gale = global_gale_state
         self._event_recorder = event_recorder
         self._last_known_balance: float | None = None
@@ -105,7 +98,7 @@ class SignalEngine:
         self._session_base_max = max(1.0, float(session_base_max))
         self._scaling_anchor_balance: float | None = None
         self._ultimo_resultado: str | None = None
-        # G2 queda formalmente deshabilitado para este flujo (solo ENTRADA + G1).
+        # Se mantiene G2 disponible en el flujo; la aprobación humana puede deshabilitarse por config.
         _ = g2_human_approval
         _ = g2_approval_timeout_seconds
         self._g2_human_approval = False
@@ -121,12 +114,14 @@ class SignalEngine:
         # CRITICAL FIX: Broker-level lock to serialize all browser operations
         self._broker_lock = asyncio.Lock()
         
-        logging.info("[MODO OPERATIVO] G2 deshabilitado: money management opera solo ENTRADA + G1")
+        logging.info("[MODO OPERATIVO] Money management opera con ENTRADA + G1 + G2")
 
         # Manual Operation Tracker — para registrar operaciones manuales del usuario
         self._manual_operation_tracker = manual_operation_tracker
         # Flag: el bot está en medio de una operación propia (para ignorar ese cambio de saldo)
         self._bot_trade_in_progress: bool = False
+        # Si una operación manual gana antes del click programado, cancelar la señal activa.
+        self._cancel_active_signal_by_manual_win: bool = False
         self._pocket_min_order_amount = max(0.01, float(pocket_min_order_amount))
         # Freno automático por racha de pérdidas recientes (ventana deslizante)
         self._session_loss_brake_enabled = bool(session_loss_brake_enabled)
@@ -136,6 +131,112 @@ class SignalEngine:
         self._session_loss_brake_step = max(0.0, float(session_loss_brake_step))
         self._session_loss_brake_floor = max(0.05, min(1.0, float(session_loss_brake_floor)))
         self._recent_cycle_loss_times: list[datetime] = []
+        self._payout_min_profitable: float = max(0.01, min(0.99, float(payout_min_profitable)))
+
+    async def start_asset_payout_monitor(
+        self,
+        poll_interval: float = 8.0,
+    ) -> None:
+        """Loop en background que detecta cambios de par seleccionado en el broker.
+
+        Cada `poll_interval` segundos lee el activo activo en la UI. Si cambió:
+        - Refresca el payout del nuevo par.
+        - Si el nuevo payout cae por debajo de `_payout_min_profitable`, emite
+          advertencia en log y muestra el popup (modo HÍBRIDO) o sólo loguea (AUTOMATICO).
+          La advertencia NO bloquea señales ya en curso; actúa sobre las siguientes.
+        """
+        logging.info(
+            "[AssetPayoutMonitor] Iniciado — poll=%.1fs | umbral_rentabilidad=%.0f%%",
+            poll_interval,
+            self._payout_min_profitable * 100.0,
+        )
+        last_asset: str | None = None
+
+        while True:
+            try:
+                await asyncio.sleep(poll_interval)
+                current_asset = await self._pocket_client.get_selected_asset()
+                if not current_asset:
+                    continue
+
+                if last_asset is None:
+                    last_asset = current_asset
+                    continue
+
+                if current_asset == last_asset:
+                    continue
+
+                # ── Cambio detectado ──────────────────────────────────────────
+                prev_asset = last_asset  # guardar antes de actualizar
+                last_asset = current_asset
+                logging.info(
+                    "[AssetPayoutMonitor] Cambio de par detectado: %s → %s. Refrescando payout y saldo.",
+                    prev_asset,
+                    current_asset,
+                )
+                self._emit_event(
+                    "asset_changed_by_user",
+                    previous_asset=prev_asset,
+                    new_asset=current_asset,
+                )
+
+                # Refrescar payout del nuevo par
+                await self._refresh_dynamic_payout(current_asset)
+
+                # Refrescar saldo para que la calculadora tenga datos actualizados
+                # del nuevo par antes de recibir la próxima señal
+                try:
+                    fresh_balance = await self._safe_get_balance()
+                    logging.info(
+                        "[AssetPayoutMonitor] Saldo actualizado tras cambio de par: $%.2f",
+                        fresh_balance,
+                    )
+                    if self._session_manager is not None:
+                        self._session_manager.observe_balance(fresh_balance)
+                except Exception as _bal_exc:
+                    logging.debug(
+                        "[AssetPayoutMonitor] No se pudo releer saldo tras cambio de par: %s",
+                        _bal_exc,
+                    )
+
+                # Comprobar rentabilidad del nuevo par
+                payout_pct = self._calc_payout * 100.0
+                if payout_pct / 100.0 < self._payout_min_profitable:
+                    operation_mode = self._operation_mode_last or "AUTOMATICO"
+                    is_manual = operation_mode == "HIBRIDO"
+                    logging.warning(
+                        "[AssetPayoutMonitor] ⛔ Par %s tiene payout NO rentable: %.1f%% < %.0f%%",
+                        current_asset,
+                        payout_pct,
+                        self._payout_min_profitable * 100.0,
+                    )
+                    self._emit_event(
+                        "asset_payout_unprofitable_on_change",
+                        asset=current_asset,
+                        payout_percent=payout_pct,
+                        min_profitable_pct=self._payout_min_profitable * 100.0,
+                        operation_mode=operation_mode,
+                    )
+                    if is_manual:
+                        await check_payout_or_notify(
+                            asset=current_asset,
+                            payout_percent=payout_pct,
+                            min_profitable=self._payout_min_profitable,
+                            is_manual_mode=True,
+                        )
+                else:
+                    logging.info(
+                        "[AssetPayoutMonitor] Par %s — payout %.1f%% ✓ (mínimo=%.0f%%)",
+                        current_asset,
+                        payout_pct,
+                        self._payout_min_profitable * 100.0,
+                    )
+
+            except asyncio.CancelledError:
+                logging.info("[AssetPayoutMonitor] Monitor detenido.")
+                return
+            except Exception as exc:
+                logging.debug("[AssetPayoutMonitor] Error en ciclo de polling: %s", exc)
 
     async def start_balance_monitor(
         self,
@@ -588,6 +689,23 @@ class SignalEngine:
             balance_before,
             balance_after,
         )
+
+        # Si una manual WIN cierra antes de que el bot cliquee su señal programada,
+        # anular esa señal evita doble exposición en la misma ventana.
+        if result == "W" and not self._bot_trade_in_progress:
+            self._cancel_active_signal_by_manual_win = True
+            logging.info(
+                "[BalanceMonitor] WIN manual confirmado. Se anulará la señal programada pendiente.",
+            )
+            self._emit_event(
+                "manual_win_override_signal",
+                balance_before=balance_before,
+                balance_after=balance_after,
+                diff=diff,
+                asset=asset,
+                side=side,
+                amount=amount,
+            )
         
         # ─────────────────────────────────────────────────────────────────────
         # PASO 1: SINCRONIZACIÓN CON GLOBAL GALE STATE
@@ -603,9 +721,16 @@ class SignalEngine:
         self._sync_session_loss_from_global()
         
         # ─────────────────────────────────────────────────────────────────────
-        # PASO 2: SINCRONIZACIÓN CON SESSION MANAGER
+        # PASO 2: SINCRONIZACIÓN CON SESSION MANAGER (saldo real reconciliado)
         # ─────────────────────────────────────────────────────────────────────
-        self._update_session_after_result("ENTRADA", won=(result == "W"))
+        if self._session_manager is not None:
+            status = self._session_manager.registrar_resultado_externo(
+                "WIN" if result == "W" else "LOSS",
+                balance_before=balance_before,
+                balance_after=balance_after,
+            )
+            if status.get("sesion_pausada"):
+                self._alert_session_stop_loss()
         
         # ─────────────────────────────────────────────────────────────────────
         # PASO 3: REGISTRO EN MANUAL OPERATION TRACKER
@@ -686,13 +811,15 @@ class SignalEngine:
         )
 
     async def execute_signal(self, signal: TradingSignal) -> None:
-        self._bot_trade_in_progress = True
+        self._cancel_active_signal_by_manual_win = False
         try:
             await self._run_martingale_flow(signal)
         finally:
             self._bot_trade_in_progress = False
+            self._cancel_active_signal_by_manual_win = False
 
     async def _run_martingale_flow(self, signal: TradingSignal) -> None:
+        self._cancel_active_signal_by_manual_win = False
         if self._session_manager is not None and self._session_manager.sesion_pausada:
             self._alert_session_stop_loss()
             self._emit_event(
@@ -707,6 +834,27 @@ class SignalEngine:
         start_step = 0
         operation_mode = self._refresh_operation_mode(signal)
         await self._refresh_dynamic_payout(signal.asset)
+
+        # ── Comprobación de rentabilidad del payout ──────────────────────────
+        _payout_pct = self._calc_payout * 100.0
+        _is_manual = operation_mode == "HIBRIDO"
+        _payout_ok = await check_payout_or_notify(
+            asset=signal.asset or "N/A",
+            payout_percent=_payout_pct,
+            min_profitable=self._payout_min_profitable,
+            is_manual_mode=_is_manual,
+        )
+        if not _payout_ok:
+            self._emit_event(
+                "signal_skipped_low_payout",
+                asset=signal.asset,
+                side=signal.side,
+                payout_percent=_payout_pct,
+                min_profitable_pct=self._payout_min_profitable * 100.0,
+                operation_mode=operation_mode,
+            )
+            return
+        # ─────────────────────────────────────────────────────────────────────
 
         # Fuente unica de verdad para heredar deuda: GlobalGaleState.
         should_inherit_manual_loss = self._global_gale.accumulated_loss > 0
@@ -893,6 +1041,7 @@ class SignalEngine:
             before_balance, entry_price, click_at = pre_clicked
 
         close_at = click_at + timedelta(minutes=signal.expiry_minutes)
+        self._bot_trade_in_progress = True
         entry_delay = (click_at - entry_at).total_seconds()
         logging.info(
             "%s tiempos reales: entry_programada=%s click_real=%s expiry_real=%s exp=%sm delay=%.1fs",
@@ -906,13 +1055,16 @@ class SignalEngine:
 
         is_last = step_idx >= len(cycle_amounts) - 1
         if is_last:
-            won = await self._monitor_order_result_until_close(
-                before_balance,
-                close_at,
-                signal.asset,
-                signal.side,
-                entry_delay=entry_delay,
-            )
+            try:
+                won = await self._monitor_order_result_until_close(
+                    before_balance,
+                    close_at,
+                    signal.asset,
+                    signal.side,
+                    entry_delay=entry_delay,
+                )
+            finally:
+                self._bot_trade_in_progress = False
             if won is None:
                 logging.warning(
                     "Resultado desconocido en %s (delay=%.1fs). No se registra WIN ni LOSS. "
@@ -1005,20 +1157,53 @@ class SignalEngine:
                     self._watchdog_trigger()
             return
 
-        next_info = await self._monitor_and_arm_next_step(
-            signal=signal,
-            current_step_name=step_name,
-            current_close_at=close_at,
-            current_before_balance=before_balance,
-            current_entry_price=entry_price,
-            current_amount=amount,
-            current_entry_delay=entry_delay,
-            next_step_idx=step_idx + 1,
-            next_entry_at=entry_times[step_idx + 1],
-            next_amount=cycle_amounts[step_idx + 1],
-        )
+        try:
+            next_info = await self._monitor_and_arm_next_step(
+                signal=signal,
+                current_step_name=step_name,
+                current_close_at=close_at,
+                current_before_balance=before_balance,
+                current_entry_price=entry_price,
+                current_amount=amount,
+                current_entry_delay=entry_delay,
+                next_step_idx=step_idx + 1,
+                next_entry_at=entry_times[step_idx + 1],
+                next_amount=cycle_amounts[step_idx + 1],
+            )
+        except Exception:
+            self._bot_trade_in_progress = False
+            raise
         if next_info is None:
+            self._bot_trade_in_progress = False
             return
+
+        # ── Chequeo payout mid-gale (antes de ejecutar siguiente paso) ────────
+        await self._refresh_dynamic_payout(signal.asset)
+        _payout_pct_mg = self._calc_payout * 100.0
+        _is_manual_mg = (self._operation_mode_last or "AUTOMATICO") == "HIBRIDO"
+        _payout_ok_mg = await check_payout_or_notify(
+            asset=signal.asset or "N/A",
+            payout_percent=_payout_pct_mg,
+            min_profitable=self._payout_min_profitable,
+            is_manual_mode=_is_manual_mg,
+        )
+        if not _payout_ok_mg:
+            logging.warning(
+                "⛔ Martingala %d cancelada por payout insuficiente mid-sesión: %.1f%% < %.0f%%",
+                step_idx + 1,
+                _payout_pct_mg,
+                self._payout_min_profitable * 100.0,
+            )
+            self._emit_event(
+                "gale_step_skipped_low_payout",
+                asset=signal.asset,
+                side=signal.side,
+                step_idx=step_idx + 1,
+                payout_percent=_payout_pct_mg,
+                min_profitable_pct=self._payout_min_profitable * 100.0,
+            )
+            return
+        # ─────────────────────────────────────────────────────────────────────
 
         await self._execute_step_chain(
             signal,
@@ -1467,6 +1652,13 @@ class SignalEngine:
         execute_at: datetime,
         amount: float,
     ) -> bool:
+        if self._cancel_active_signal_by_manual_win:
+            logging.info(
+                "%s cancelada: WIN manual detectado antes del click programado.",
+                step_name,
+            )
+            return False
+
         now_utc = datetime.now(timezone.utc)
         delay = (execute_at - now_utc).total_seconds()
         prepare_lead_seconds, send_lead_seconds = self._dynamic_timing_leads(signal.expiry_minutes)
@@ -1498,6 +1690,12 @@ class SignalEngine:
                     eager_prepare=eager_prepare,
                 )
             except RuntimeError as exc:
+                if "MANUAL_WIN_OVERRIDE" in str(exc):
+                    logging.info(
+                        "%s cancelada por override de WIN manual durante countdown.",
+                        step_name,
+                    )
+                    return False
                 # CRITICAL FIX: If asset not available, cancel signal immediately
                 if "ACTIVO_NO_DISPONIBLE" in str(exc):
                     logging.warning(
@@ -1507,6 +1705,12 @@ class SignalEngine:
                     )
                     raise RuntimeError(f"{step_name} cancelada: activo no disponible")
                 raise
+            if self._cancel_active_signal_by_manual_win:
+                logging.info(
+                    "%s cancelada: WIN manual confirmado justo antes del click.",
+                    step_name,
+                )
+                return False
             return True
 
         threshold = float(self._signal_late_tolerance_seconds)
@@ -1528,18 +1732,26 @@ class SignalEngine:
                 abs(delay),
             )
 
+        if self._cancel_active_signal_by_manual_win:
+            logging.info(
+                "%s cancelada en ventana inmediata por WIN manual confirmado.",
+                step_name,
+            )
+            return False
+
         # Señal en ventana inmediata: puede no haber pasado por _run_countdown_and_prepare.
         # Forzamos preparación rápida para no clickear con el activo/monto anterior.
         from src.core.console_hub import print_countdown_line, clear_countdown_line
-        print_countdown_line(
-            step_name=step_name,
-            asset=signal.asset,
-            side=signal.side,
-            amount=amount,
-            hh=0, mm=0, ss=0,
-            semaphore="VERDE LISTO",
-            color_output=self._color_output,
-        )
+        if self._pocket_client.execute_orders_enabled():
+            print_countdown_line(
+                step_name=step_name,
+                asset=signal.asset,
+                side=signal.side,
+                amount=amount,
+                hh=0, mm=0, ss=0,
+                semaphore="VERDE LISTO",
+                color_output=self._color_output,
+            )
         try:
             await self._pocket_client.prepare_order_for_execution(
                 signal.asset,
@@ -1851,8 +2063,11 @@ class SignalEngine:
     ) -> None:
         preparation_done = False
         next_eager_retry_at = datetime.now(timezone.utc)
+        show_terminal_countdown = self._pocket_client.execute_orders_enabled()
 
         if eager_prepare:
+            if self._cancel_active_signal_by_manual_win:
+                raise RuntimeError("MANUAL_WIN_OVERRIDE")
             try:
                 logging.info(
                     "%s prearmado temprano: preparando orden desde llegada de señal.",
@@ -1874,6 +2089,8 @@ class SignalEngine:
                 next_eager_retry_at = datetime.now(timezone.utc) + timedelta(seconds=3)
 
         while True:
+            if self._cancel_active_signal_by_manual_win:
+                raise RuntimeError("MANUAL_WIN_OVERRIDE")
             now_utc = datetime.now(timezone.utc)
             remaining = (execute_at - now_utc).total_seconds()
             if remaining <= send_lead_seconds:
@@ -1905,20 +2122,22 @@ class SignalEngine:
                 semaforo = "AMARILLO PREPARANDO"
             else:
                 semaforo = "ROJO ESPERANDO"
-            print_countdown_line(
-                step_name=step_name,
-                asset=signal.asset,
-                side=signal.side,
-                amount=amount,
-                hh=hours,
-                mm=mins,
-                ss=sec,
-                semaphore=semaforo,
-                color_output=self._color_output,
-            )
+            if show_terminal_countdown:
+                print_countdown_line(
+                    step_name=step_name,
+                    asset=signal.asset,
+                    side=signal.side,
+                    amount=amount,
+                    hh=hours,
+                    mm=mins,
+                    ss=sec,
+                    semaphore=semaforo,
+                    color_output=self._color_output,
+                )
             await asyncio.sleep(0.1)
 
-        clear_countdown_line()
+        if show_terminal_countdown:
+            clear_countdown_line()
 
     def _format_ref_time(self, value: datetime) -> str:
         local = value.astimezone(self._reference_tz)
@@ -1942,17 +2161,31 @@ class SignalEngine:
         return
 
     def _session_amounts(self) -> list[float]:
-        """Calcula [entry, G1] exclusivamente desde SessionManager."""
+        """Calcula [entry, G1, G2] exclusivamente desde SessionManager."""
         assert self._session_manager is not None
 
         stakes = self._session_manager.get_stakes_para_senal(self._pocket_min_order_amount)
         entry = self._apply_broker_amount_floor(stakes["entry"])
-        g1_amount = self._apply_broker_amount_floor(stakes["g1"])
-
-        amounts = [entry, g1_amount]
+        raw_g1 = float(stakes.get("g1", 0.0) or 0.0)
+        raw_g2 = float(
+            self._session_manager.peek_stake_after_losses(
+                losses_ahead=2,
+                min_order=self._pocket_min_order_amount,
+            )
+            or 0.0
+        )
+        amounts = [entry]
+        g1_amount = 0.0
+        g2_amount = 0.0
+        if raw_g1 > 0:
+            g1_amount = self._apply_broker_amount_floor(raw_g1)
+            amounts.append(g1_amount)
+        if raw_g2 > 0:
+            g2_amount = self._apply_broker_amount_floor(raw_g2)
+            amounts.append(g2_amount)
         logging.info(
             "Sesion %d/%d: señal %d/%d wins=%d losses=%d "
-            "entry=%.2f g1=%.2f max_riesgo=%.2f amounts=%s",
+            "entry=%.2f g1=%.2f g2=%.2f max_riesgo=%.2f amounts=%s",
             self._session_manager.n_ops,
             self._session_manager.w_needed,
             self._session_manager.signals_consumed + 1,
@@ -1961,6 +2194,7 @@ class SignalEngine:
             self._session_manager.losses,
             entry,
             g1_amount,
+            g2_amount,
             float(stakes["max_riesgo"]),
             amounts,
         )
@@ -1991,8 +2225,9 @@ class SignalEngine:
 
     def _dynamic_timing_leads(self, expiry_minutes: int) -> tuple[float, float]:
         expiry_seconds = max(60.0, float(expiry_minutes) * 60.0)
-        send_lead = min(3.0, max(0.4, expiry_seconds * 0.01))
-        prepare_lead = min(35.0, max(send_lead + 2.0, expiry_seconds * 0.25))
+        # Ventana más conservadora para reducir desincronización en expiraciones cortas.
+        send_lead = min(3.0, max(1.2, expiry_seconds * 0.015))
+        prepare_lead = min(40.0, max(send_lead + 3.0, expiry_seconds * 0.30))
         return prepare_lead, send_lead
 
     def _print_realtime_monitor(

@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
-from src.core.gale_manager import GaleManager
-from src.core.masaniello_engine import MasanielloEngine
+
+from src.core.gale_calculator import GaleCalculator
+
 
 
 @dataclass
@@ -30,12 +31,17 @@ class SessionManager:
 
     _last_stakes: dict = field(default_factory=dict, repr=False)
     _last_updated_at: str = field(default="", repr=False)
-    _masaniello: MasanielloEngine = field(init=False, repr=False)
-    _gale: GaleManager = field(init=False, repr=False)
+    _gale_calc: GaleCalculator = field(init=False, repr=False)
 
     state_change_callback: Callable[["SessionManager", str], None] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        def _env_bool(name: str, default: bool) -> bool:
+            raw = os.getenv(name, "").strip().lower()
+            if raw == "":
+                return default
+            return raw in {"1", "true", "yes", "on"}
+
         self.capital = max(0.0, float(self.capital))
         self.payout = max(0.01, float(self.payout))
         env_max_stake_pct = os.getenv("MASANIELLO_MAX_STAKE_PCT", "").strip()
@@ -47,42 +53,66 @@ class SessionManager:
         self.max_stake_pct_of_capital = max(0.0, min(1.0, float(self.max_stake_pct_of_capital)))
         self.stop_loss_pct = max(0.0, min(0.95, float(self.stop_loss_pct)))
 
-        self._masaniello = MasanielloEngine(
-            capital=self.capital,
-            n=self.n,
-            k=self.k,
-            payout=self.payout,
-            reinversion_pct=self.reinversion_pct,
-        )
-        self._gale = GaleManager(self.payout)
+        env_incremento_alto = os.getenv("APP_CALC_INCREMENT", "2").strip()
+        env_incremento_bajo = os.getenv("APP_CALC_INCREMENT_BELOW_100", "1").strip()
+        env_incremento_umbral = os.getenv("APP_CALC_INCREMENT_THRESHOLD", "100").strip()
+        incremento_alto = 2
+        incremento_bajo = 1
+        incremento_umbral = 100.0
+        try:
+            incremento_alto = max(1, int(float(env_incremento_alto or "2")))
+        except ValueError:
+            pass
+        try:
+            incremento_bajo = max(1, int(float(env_incremento_bajo or "1")))
+        except ValueError:
+            pass
+        try:
+            incremento_umbral = float(env_incremento_umbral or "100")
+        except ValueError:
+            pass
+        objetivo_entero_par = _env_bool("APP_CALC_TARGET_EVEN_INTEGER", True)
 
-        self.capital_inicial_sesion = round(self._masaniello.capital_ciclo, 2)
-        self.balance_actual = self._masaniello.capital_ciclo
+        # Inicializa el nuevo gale calculator
+        self._gale_calc = GaleCalculator(
+            saldo_actual=self.capital,
+            payout=self.payout,
+            incremento=incremento_alto,
+            incremento_bajo_umbral=incremento_bajo,
+            incremento_umbral=incremento_umbral,
+            objetivo_entero_par=objetivo_entero_par,
+            objetivo_manual=None,
+            usar_multiplicador=False,
+            multiplicador=2.0,
+        )
+        self._wins: int = 0
+        self.capital_inicial_sesion = round(self.capital, 2)
+        self.balance_actual = self.capital
         self._touch()
 
     @property
     def signals_consumed(self) -> int:
-        return max(0, self._masaniello.op_actual - 1)
+        return self._wins + self._gale_calc.perdidas
 
     @property
     def wins(self) -> int:
-        return self._masaniello.wins
+        return self._wins
 
     @property
     def losses(self) -> int:
-        return self._masaniello.losses
+        return self._gale_calc.perdidas
 
     @property
     def n_ops(self) -> int:
-        return self._masaniello.n
+        return self.n
 
     @property
     def w_needed(self) -> int:
-        return self._masaniello.k
+        return self.k
 
     @property
     def base_balance(self) -> float:
-        return self._masaniello.capital_inicial
+        return self.capital_inicial_sesion
 
     @property
     def session_blocked(self) -> bool:
@@ -105,19 +135,23 @@ class SessionManager:
 
     def observe_balance(self, current_balance: float) -> None:
         self.balance_actual = max(0.0, float(current_balance))
+        self._gale_calc.saldo_actual = self.balance_actual
 
     def sync_accumulated_loss(self, amount: float) -> None:
         # Legacy no-op para mantener compatibilidad con llamadas existentes.
         _ = amount
 
     def get_stakes_para_senal(self, min_order: float = 0.01) -> dict:
-        # Stake fijo de $1 independientemente de Masaniello o gestión dinámica.
-        entry = 1.0
-        g1 = 1.0
+        # Calcula el stake usando la lógica avanzada de gale/martingala
+        self._gale_calc.saldo_actual = self.balance_actual
+        self._gale_calc.payout = self.payout
+        self._gale_calc.recalcular_inversion()
+        entry = max(min_order, round(self._gale_calc.inversion_actual, 2))
+        g1 = self.peek_next_stake_if_loss(min_order=min_order)
         max_riesgo = round(entry + g1, 2)
         self._last_stakes = {"entry": entry, "g1": g1, "max_riesgo": max_riesgo}
         self._touch()
-        self._notify("masaniello_stake_calculado")
+        self._notify("gale_stake_calculado")
         return self._last_stakes.copy()
 
     def get_next_stake(self, min_order: float = 0.01) -> float:
@@ -126,9 +160,36 @@ class SessionManager:
     def current_entry_stake(self) -> float:
         return self.get_next_stake()
 
+    def _clone_gale_calc(self) -> GaleCalculator:
+        """Clona el estado interno del calculador para simulaciones sin side effects."""
+        return GaleCalculator(
+            saldo_actual=float(self._gale_calc.saldo_actual),
+            payout=float(self._gale_calc.payout),
+            incremento=int(self._gale_calc.incremento),
+            incremento_bajo_umbral=int(self._gale_calc.incremento_bajo_umbral),
+            incremento_umbral=float(self._gale_calc.incremento_umbral),
+            objetivo_entero_par=bool(self._gale_calc.objetivo_entero_par),
+            objetivo_manual=self._gale_calc.objetivo_manual,
+            usar_multiplicador=bool(self._gale_calc.usar_multiplicador),
+            multiplicador=float(self._gale_calc.multiplicador),
+            perdidas=int(self._gale_calc.perdidas),
+            inversion_base=float(self._gale_calc.inversion_base),
+            inversion_actual=float(self._gale_calc.inversion_actual),
+            saldo_objetivo=float(self._gale_calc.saldo_objetivo),
+            regla10_limite=float(self._gale_calc.regla10_limite),
+            regla10_tolerancia_pct=float(self._gale_calc.regla10_tolerancia_pct),
+            mensaje=str(self._gale_calc.mensaje),
+        )
+
+    def peek_stake_after_losses(self, losses_ahead: int, min_order: float = 0.01) -> float:
+        """Simula el stake futuro tras N pérdidas consecutivas desde el estado actual."""
+        simulated = self._clone_gale_calc()
+        for _ in range(max(0, int(losses_ahead))):
+            simulated.on_perdio()
+        return max(min_order, round(simulated.inversion_actual, 2))
+
     def peek_next_stake_if_loss(self, min_order: float = 0.01) -> float:
-        # Stake fijo de $1.
-        return 1.0
+        return self.peek_stake_after_losses(losses_ahead=1, min_order=min_order)
 
     def registrar_resultado_senal(self, result_entry: str, result_g1: str | None = None) -> dict:
         if self.sesion_pausada:
@@ -138,35 +199,120 @@ class SessionManager:
                 "sesion_pausada": True,
             }
 
-        resultado_final = self._gale.resolver_resultado(result_entry, result_g1)
-        if resultado_final == "PENDIENTE":
-            return {
-                "registrado": False,
-                "resultado_final": resultado_final,
-                "sesion_pausada": self.sesion_pausada,
-            }
-
-        op_antes = self._masaniello.op_actual
-        self._masaniello.registrar_resultado(resultado_final)
-        reinicio_ciclo = op_antes > self._masaniello.op_actual
+        if result_entry.upper() in {"WIN", "W"}:
+            self._gale_calc.on_gano()
+            self._wins += 1
+            resultado_final = "WIN"
+        elif result_entry.upper() in {"LOSS", "L"}:
+            self._gale_calc.on_perdio()
+            resultado_final = "LOSS"
+        else:
+            resultado_final = "PENDIENTE"
 
         self.last_result_label = resultado_final
         self.last_closed_at_utc = datetime.now(timezone.utc).isoformat()
-        self.balance_actual = self._masaniello.capital_ciclo
+        self.balance_actual = self._gale_calc.saldo_actual
 
         if resultado_final == "LOSS":
             self.blocks_lost_today += 1
 
         self._touch()
         self._evaluar_stop_loss_sesion()
-        self._notify(f"masaniello_resultado:{resultado_final}")
+        self._notify(f"gale_resultado:{resultado_final}")
 
         return {
             "registrado": True,
             "resultado_final": resultado_final,
-            "reinicio_ciclo": reinicio_ciclo,
+            "reinicio_ciclo": False,
             "sesion_pausada": self.sesion_pausada,
             "estado": self.get_estado(),
+        }
+
+    def _aplicar_loss_externo_con_reglas(self) -> None:
+        """Aplica transición LOSS respetando reglas del gale usando saldo real ya reconciliado.
+
+        Esta ruta se usa para operaciones manuales detectadas por balance real del broker.
+        """
+        self._gale_calc.perdidas += 1
+        saldo = max(0.0, float(self._gale_calc.saldo_actual))
+        limite = int(saldo * 0.10)
+
+        if not self._gale_calc.regla10_activa() and self._gale_calc.perdidas >= 3:
+            self._gale_calc.perdidas = 0
+            self._gale_calc.recalcular_inversion()
+            self._gale_calc.mensaje = "🔄 Reset gale por 3 pérdidas (saldo <= $50)"
+            return
+
+        if self._gale_calc.usar_multiplicador:
+            siguiente = self._gale_calc.inversion_actual * self._gale_calc.multiplicador
+        else:
+            utilidad_necesaria = self._gale_calc.saldo_objetivo - saldo
+            siguiente = (
+                utilidad_necesaria / self._gale_calc.payout
+                if self._gale_calc.payout > 0 and utilidad_necesaria > 0
+                else 0.0
+            )
+
+        if self._gale_calc.regla10_activa() and siguiente >= limite:
+            self._gale_calc.perdidas = 0
+            self._gale_calc.recalcular_inversion()
+            self._gale_calc.mensaje = "⚠️ Reset por riesgo (>10% de la cuenta)"
+            return
+
+        self._gale_calc.inversion_actual = siguiente
+        self._gale_calc.mensaje = f"❌ Perdiste - Gale {self._gale_calc.perdidas}"
+
+    def registrar_resultado_externo(
+        self,
+        result_label: str,
+        balance_before: float,
+        balance_after: float,
+    ) -> dict:
+        """Reconciliación de resultado externo (manual) con saldo real del broker.
+
+        Conserva reglas de la calculadora y evita doble descuento de saldo.
+        """
+        if self.sesion_pausada:
+            return {
+                "registrado": False,
+                "resultado_final": "PAUSADA",
+                "sesion_pausada": True,
+            }
+
+        normalized = str(result_label).strip().upper()
+        self.balance_actual = max(0.0, float(balance_after))
+        self._gale_calc.saldo_actual = self.balance_actual
+
+        if normalized in {"WIN", "W", "WIN DIRECTO", "G1"}:
+            self._wins += 1
+            self._gale_calc.perdidas = 0
+            self._gale_calc.objetivo_manual = None
+            self._gale_calc.recalcular_inversion()
+            self._gale_calc.mensaje = (
+                f"✅ Ganaste (manual) | saldo reconciliado: ${self.balance_actual:.2f}"
+            )
+            resultado_final = "WIN"
+        elif normalized in {"LOSS", "L"}:
+            self._aplicar_loss_externo_con_reglas()
+            resultado_final = "LOSS"
+            self.blocks_lost_today += 1
+        else:
+            raise ValueError(f"Resultado externo no soportado: {result_label}")
+
+        self.last_result_label = resultado_final
+        self.last_closed_at_utc = datetime.now(timezone.utc).isoformat()
+        self._touch()
+        self._evaluar_stop_loss_sesion()
+        self._notify(f"gale_resultado_externo:{resultado_final}")
+
+        return {
+            "registrado": True,
+            "resultado_final": resultado_final,
+            "reinicio_ciclo": False,
+            "sesion_pausada": self.sesion_pausada,
+            "estado": self.get_estado(),
+            "balance_before": float(balance_before),
+            "balance_after": self.balance_actual,
         }
 
     def update_session_status(
@@ -195,7 +341,7 @@ class SessionManager:
 
     def _evaluar_stop_loss_sesion(self) -> None:
         floor = self.capital_inicial_sesion * (1.0 - self.stop_loss_pct)
-        if self._masaniello.capital_ciclo < floor:
+        if self.balance_actual < floor:
             self.sesion_pausada = True
 
     def reset_session(
@@ -220,10 +366,9 @@ class SessionManager:
 
     def update_base(self, new_base: float) -> None:
         capital = max(0.0, float(new_base))
-        self._masaniello.capital = capital
-        self._masaniello.capital_inicial = round(capital, 2)
-        self._masaniello.capital_ciclo = round(capital, 2)
         self.capital_inicial_sesion = round(capital, 2)
+        self.balance_actual = round(capital, 2)
+        self._gale_calc.saldo_actual = round(capital, 2)
         self._touch()
 
     def update_payout_mult(self, payout_mult: float) -> None:
@@ -232,66 +377,60 @@ class SessionManager:
 
     def update_payout(self, payout: float) -> None:
         self.payout = max(0.01, float(payout))
-        self._masaniello.payout = self.payout
-        self._gale.payout = self.payout
+        self._gale_calc.payout = self.payout
         self._touch()
 
     def get_estado(self) -> dict:
-        masaniello_state = self._masaniello.to_dict()
+        gale_state = self._gale_calc.get_estado()
         return {
-            "op_actual": masaniello_state["op_actual"],
-            "wins": masaniello_state["wins"],
-            "losses": masaniello_state["losses"],
-            "capital_ciclo": masaniello_state["capital_ciclo"],
-            "capital_inicial": masaniello_state["capital_inicial"],
-            "n": masaniello_state["n"],
-            "k": masaniello_state["k"],
-            "payout": masaniello_state["payout"],
-            "reinversion_pct": masaniello_state["reinversion_pct"],
+            "op_actual": self.signals_consumed + 1,
+            "wins": self._wins,
+            "losses": self._gale_calc.perdidas,
+            "capital_ciclo": self.balance_actual,
+            "capital_inicial": self.capital_inicial_sesion,
+            "n": self.n,
+            "k": self.k,
+            "payout": self.payout,
+            "reinversion_pct": self.reinversion_pct,
             "sesion_pausada": self.sesion_pausada,
             "capital_inicial_sesion": self.capital_inicial_sesion,
             "stop_loss_pct": self.stop_loss_pct,
             "last_result_label": self.last_result_label,
             "last_stakes": self._last_stakes.copy(),
+            "inversion_actual": gale_state["inversion_actual"],
+            "gale_mensaje": gale_state["mensaje"],
         }
 
     def to_dict(self) -> dict:
         return {
-            "masaniello": self._masaniello.to_dict(),
+            "gale_state": self._gale_calc.get_estado(),
+            "wins": self._wins,
+            "losses": self._gale_calc.perdidas,
+            "payout": self.payout,
+            "capital": self.capital,
+            "balance_actual": self.balance_actual,
             "sesion_pausada": self.sesion_pausada,
             "capital_inicial_sesion": self.capital_inicial_sesion,
+            "last_result_label": self.last_result_label,
             "timestamp_ultima_actualizacion": self._last_updated_at,
         }
 
     def restore_state(self, state: dict, notify: bool = False) -> None:
         payload = state.get("state", state)
-        masaniello_payload = payload.get("masaniello") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return
 
-        if isinstance(masaniello_payload, dict):
-            self._masaniello = MasanielloEngine.from_dict(masaniello_payload)
-            self._gale = GaleManager(float(masaniello_payload.get("payout", self.payout)))
-            self.payout = self._gale.payout
-            self.sesion_pausada = bool(payload.get("sesion_pausada", False))
-            self.capital_inicial_sesion = float(
-                payload.get("capital_inicial_sesion", self._masaniello.capital_inicial)
-            )
-            self._last_updated_at = str(payload.get("timestamp_ultima_actualizacion", ""))
-            self.balance_actual = self._masaniello.capital_ciclo
-        else:
-            # Fallback compatible para snapshots legacy.
-            self.payout = max(0.01, float(payload.get("payout", self.payout)))
-            self._masaniello = MasanielloEngine(
-                capital=float(payload.get("balance_actual", self.capital)),
-                n=int(payload.get("max_messages_per_session", self.n)),
-                k=max(1, int(payload.get("wins", 0)) + 1),
-                payout=self.payout,
-                reinversion_pct=self.reinversion_pct,
-            )
-            self._gale = GaleManager(self.payout)
-            self.sesion_pausada = bool(payload.get("global_stop", False) or payload.get("is_session_blocked", False))
-            self.capital_inicial_sesion = float(payload.get("balance_maximo_historico", self._masaniello.capital_inicial))
-            self.balance_actual = float(payload.get("balance_actual", self._masaniello.capital_ciclo))
-            self._last_updated_at = datetime.now(timezone.utc).isoformat()
+        self.payout = max(0.01, float(payload.get("payout", self.payout)))
+        self.balance_actual = float(payload.get("balance_actual", self.capital))
+        self.capital_inicial_sesion = float(payload.get("capital_inicial_sesion", self.capital))
+        self.sesion_pausada = bool(payload.get("sesion_pausada", False))
+        self.last_result_label = str(payload.get("last_result_label", ""))
+        self._last_updated_at = str(payload.get("timestamp_ultima_actualizacion", ""))
+        self._wins = int(payload.get("wins", 0))
+        self._gale_calc.saldo_actual = self.balance_actual
+        self._gale_calc.payout = self.payout
+        self._gale_calc.perdidas = int(payload.get("losses", 0))
+        self._gale_calc.recalcular_inversion()
 
         self._evaluar_stop_loss_sesion()
         if notify:
