@@ -102,6 +102,7 @@ class AppSettings:
     color_output: bool = True
     override_side: Optional[str] = None
     manual_operations_enabled: bool = False
+    payout_min_profitable: float = 0.80
 
     @staticmethod
     def load() -> "AppSettings":
@@ -311,6 +312,13 @@ class AppSettings:
             ),
             manual_operations_enabled=_to_bool(
                 os.getenv("APP_MANUAL_OPERATIONS_ENABLED", "false")
+            ),
+            payout_min_profitable=max(
+                0.01,
+                min(
+                    0.99,
+                    float(os.getenv("APP_PAYOUT_MIN_PROFITABLE", "0.80")),
+                ),
             ),
         )
 

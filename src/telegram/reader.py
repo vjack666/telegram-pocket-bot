@@ -2,6 +2,7 @@ import asyncio
 from collections import deque
 import inspect
 import logging
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -57,6 +58,13 @@ _PERIODIC_SOFT_RECONNECT_SECONDS = 0
 # Tiempo máximo de espera entre reintentos de reconexión (segundos)
 _MAX_RETRY_SECONDS = 30
 _INVITE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", re.IGNORECASE)
+
+
+def _to_bool(value: str, default: bool = False) -> bool:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on", "y"}
 
 
 class TelegramSignalReader:
@@ -123,6 +131,79 @@ class TelegramSignalReader:
         self._processed_ids_max = 5000
         self._processed_ids_set: set[str] = set()
         self._processed_ids_order: deque[str] = deque()
+
+    async def _prompt_console(self, prompt: str, secret: bool = False) -> str:
+        if secret:
+            import getpass
+
+            value = await asyncio.to_thread(getpass.getpass, prompt)
+            return (value or "").strip()
+
+        value = await asyncio.to_thread(input, prompt)
+        return (value or "").strip()
+
+    async def _ensure_authorized(self) -> None:
+        """Garantiza sesión autorizada con recuperación automática segura.
+
+        Flujo:
+        1) Conectar cliente.
+        2) Si ya está autorizado, continuar.
+        3) Si no, intentar login interactivo en terminal (opcional por env).
+        """
+        await self._client.connect()
+        if await self._client.is_user_authorized():
+            return
+
+        allow_interactive = _to_bool(
+            os.getenv("APP_TELEGRAM_ALLOW_INTERACTIVE_AUTH", "true"),
+            default=True,
+        )
+        phone_from_env = os.getenv("TELEGRAM_PHONE", "").strip()
+
+        if not allow_interactive:
+            raise RuntimeError(
+                "Sesion Telegram no autorizada y APP_TELEGRAM_ALLOW_INTERACTIVE_AUTH=false. "
+                "Reautentica TELEGRAM_SESSION_NAME antes de iniciar."
+            )
+
+        logging.warning(
+            "Sesion Telegram no autorizada. Iniciando reautenticacion interactiva en terminal..."
+        )
+
+        def _phone_cb() -> str:
+            if phone_from_env:
+                return phone_from_env
+            return input("Telefono Telegram (formato internacional, ej +54911...): ").strip()
+
+        def _code_cb() -> str:
+            # Codigo temporal de Telegram; nunca se registra en logs.
+            return input("Codigo Telegram recibido: ").strip()
+
+        def _password_cb() -> str:
+            import getpass
+
+            return getpass.getpass("Password 2FA (si aplica): ").strip()
+
+        try:
+            start_result = self._client.start(
+                phone=_phone_cb,
+                code_callback=_code_cb,
+                password=_password_cb,
+            )
+            await self._await_if_needed(start_result)
+        except Exception as exc:
+            raise RuntimeError(
+                "No se pudo completar la reautenticacion de Telegram. "
+                "Verifica TELEGRAM_API_ID/HASH, telefono/codigo y estado de la cuenta."
+            ) from exc
+
+        if not await self._client.is_user_authorized():
+            raise RuntimeError(
+                "Sesion Telegram no autorizada despues de reautenticacion. "
+                "Revisa TELEGRAM_SESSION_NAME y vuelve a intentar."
+            )
+
+        logging.info("Telegram reautenticado correctamente; sesion persistida en disco.")
 
     # ------------------------------------------------------------------
     # API pública principal
@@ -202,11 +283,7 @@ class TelegramSignalReader:
         Loop blindado de reconexión. Llama a este método desde main.py
         en lugar del antiguo start(). No recrea el cliente en ningún momento.
         """
-        await self._client.connect()
-        if not await self._client.is_user_authorized():
-            raise RuntimeError(
-                "Sesion Telegram no autorizada. Reautentica TELEGRAM_SESSION_NAME antes de iniciar."
-            )
+        await self._ensure_authorized()
 
         resolved_chats = await self._resolve_source_chats()
         if not resolved_chats:
@@ -325,7 +402,7 @@ class TelegramSignalReader:
                 try:
                     if not self._client.is_connected():
                         logging.info("Telegram: reconectando cliente...")
-                        await self._client.connect()
+                        await self._ensure_authorized()
                 except Exception as exc:
                     logging.warning("Telegram: fallo al reconectar (%s), reintentando...", exc)
         finally:
@@ -355,11 +432,7 @@ class TelegramSignalReader:
 
     async def start(self, on_message: MessageHandler) -> None:
         """Deprecated: usar run() con shutdown_event para reconexión blindada."""
-        await self._client.connect()
-        if not await self._client.is_user_authorized():
-            raise RuntimeError(
-                "Sesion Telegram no autorizada. Reautentica TELEGRAM_SESSION_NAME antes de iniciar."
-            )
+        await self._ensure_authorized()
         resolved_chats = await self._resolve_source_chats()
         if not resolved_chats:
             raise RuntimeError(

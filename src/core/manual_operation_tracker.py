@@ -115,9 +115,10 @@ class ManualOperationTracker:
             )
             self._gale_state.record_win()
             if self._session_manager is not None:
-                self._session_manager.update_session_status(
+                self._session_manager.registrar_resultado_externo(
                     "WIN",
-                    current_balance=balance_after,
+                    balance_before=balance_before,
+                    balance_after=balance_after if balance_after is not None else balance_before,
                 )
             if self._manual_strategy is not None and hasattr(self._manual_strategy, "record_win"):
                 self._manual_strategy.record_win()
@@ -134,10 +135,14 @@ class ManualOperationTracker:
             )
             self._gale_state.record_loss(amount)
             if self._session_manager is not None:
-                self._session_manager.update_session_status(
+                self._session_manager.registrar_resultado_externo(
                     "LOSS",
-                    debt_after_loss=self._gale_state.accumulated_loss,
-                    current_balance=balance_after,
+                    balance_before=balance_before,
+                    balance_after=(
+                        balance_after
+                        if balance_after is not None
+                        else max(0.0, float(balance_before) - float(amount))
+                    ),
                 )
             if self._manual_strategy is not None and hasattr(self._manual_strategy, "record_loss"):
                 self._manual_strategy.record_loss(amount)

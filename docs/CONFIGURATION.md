@@ -60,14 +60,19 @@ Usa `.env.example` como plantilla base.
 | `MASANIELLO_REINVERSION`                  | float     | `1.0`      | % de ganancias a reinvertir (0.0–1.0). 1.0 = 100% reinvestment |
 | `APP_SESSION_STOP_LOSS_PCT`               | float     | `0.20`     | Drawdown máximo permitido (20% = 0.20). Pausa sesión al alcanzarlo |
 | `APP_PAYOUT_DEFAULT`                      | float     | `92`       | Payout fallback (%) cuando no se puede leer dinámico del broker |
+| `APP_CALC_INCREMENT`                      | int       | `2`        | Incremento objetivo cuando el saldo está por encima de `APP_CALC_INCREMENT_THRESHOLD` |
+| `APP_CALC_INCREMENT_BELOW_100`            | int       | `1`        | Incremento objetivo cuando el saldo está por debajo o igual al umbral |
+| `APP_CALC_INCREMENT_THRESHOLD`            | float     | `100`      | Umbral de saldo para cambiar entre incremento bajo/alto |
+| `APP_CALC_TARGET_EVEN_INTEGER`            | bool      | `true`     | Si `true`, el saldo objetivo se fuerza a entero par (sin centavos) |
 | `POCKET_MIN_ORDER_AMOUNT`                 | float     | `1.0`      | Monto mínimo permitido para escribir en la UI del broker |
 
 **Notas importantes:**
 - **Motor Masaniello:** Calcula stake óptimo basado en table recursiva (backward-induction). Exact match del algoritmo de Excel.
-- **Splits Entry+G1:** Cada stake Masaniello se divide en Entry + Gale1 (usando `gale_factor`). Gale2 está **deshabilitado**.
+- **Secuencia operativa activa:** El motor automático trabaja con 3 pasos por señal: `ENTRADA -> G1 -> G2`, sincronizados por `expiry_minutes`.
 - **Stop Loss:** Sesión se pausa automáticamente cuando `capital_ciclo < capital_inicial_sesion × (1 - stop_loss_pct)`.
 - **Reinvestment:** 100% del capital se reinvierte hasta high-water mark; % de ganancias en exceso se reinvierte según `MASANIELLO_REINVERSION`.
 - **Persistencia:** Estado completo (stakes, capital, contadores) se persiste en `runtime/session_state.json` tras cada operación.
+- **Objetivo entero par (opcional):** Si `APP_CALC_TARGET_EVEN_INTEGER=true`, la calculadora ajusta el objetivo al siguiente entero par para evitar cierres con centavos.
 
 ---
 

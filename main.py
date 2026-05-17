@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import signal
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -21,7 +22,7 @@ from src.config.settings import AppSettings
 from src.core.engine import SignalEngine
 from src.core.models import TradingSignal
 from src.core.pipeline import MessageQueue, SignalProcessor, StateManager, GlobalGaleState
-from src.core.recovery_profile import RecoveryProfile
+
 from src.core.session_manager import SessionManager
 from src.core.equity_bands import EquityBandManager
 from src.core.daily_profit_tracker import DailyProfitTracker
@@ -193,6 +194,111 @@ def _set_shutdown_reason(
     )
 
 
+async def _select_account_mode_on_start(default_mode: str) -> str:
+    """Permite elegir cuenta demo/real al iniciar cuando hay terminal interactiva."""
+    normalized_default = str(default_mode or "demo").strip().lower()
+    if normalized_default not in {"demo", "real"}:
+        normalized_default = "demo"
+
+    prompt_enabled = os.getenv("APP_ACCOUNT_MODE_PROMPT_ON_START", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not prompt_enabled:
+        return normalized_default
+
+    if not sys.stdin.isatty():
+        return normalized_default
+
+    print("\nSelecciona cuenta para esta ejecución:")
+    print("  [1] Demo")
+    print("  [2] Real")
+    print(f"  Enter = usar por defecto ({normalized_default})")
+
+    while True:
+        raw = (await asyncio.to_thread(input, "Cuenta (1/2, demo/real): ")).strip().lower()
+        if not raw:
+            return normalized_default
+        if raw in {"1", "d", "demo"}:
+            return "demo"
+        if raw in {"2", "r", "real"}:
+            return "real"
+        print("Opción inválida. Escribe 1/2 o demo/real.")
+
+
+async def _select_execute_orders_on_start(default_execute: bool, account_mode: str) -> bool:
+    """Switch de seguridad: en cuenta real, pedir confirmación explícita de clicks."""
+    if str(account_mode).strip().lower() != "real":
+        return bool(default_execute)
+
+    if not sys.stdin.isatty():
+        # En contexto no interactivo, fail-safe: no ejecutar clicks reales.
+        return False
+
+    print("\nSEGURIDAD CUENTA REAL")
+    print("¿Deseas habilitar clicks reales de compra/venta (BUY/SELL)?")
+    print("  [s] Sí, habilitar")
+    print("  [n] No, solo monitoreo/simulado")
+    print(f"  Enter = {'sí' if default_execute else 'no'} (por defecto)")
+
+    while True:
+        raw = (await asyncio.to_thread(input, "Habilitar clicks reales (s/n): ")).strip().lower()
+        if not raw:
+            return bool(default_execute)
+        if raw in {"s", "si", "sí", "y", "yes", "1"}:
+            return True
+        if raw in {"n", "no", "0"}:
+            return False
+        print("Opción inválida. Escribe s o n.")
+
+
+async def _confirm_real_balance_on_start(
+    detected_balance: float,
+    account_mode: str,
+    pocket_client: PocketOptionDemoClient,
+) -> float:
+    """En cuenta real, confirmar saldo detectado para evitar operar con lectura errónea."""
+    if str(account_mode).strip().lower() != "real":
+        return float(detected_balance)
+    if not sys.stdin.isatty():
+        return float(detected_balance)
+
+    balance = float(detected_balance)
+    attempts = 0
+    while True:
+        attempts += 1
+        print(f"\nSaldo REAL detectado: ${balance:,.2f}")
+        print("Opciones: [s]=usar  [r]=releer saldo  [m]=ingresar manual")
+        choice = (await asyncio.to_thread(input, "Confirmar saldo real (s/r/m): ")).strip().lower()
+
+        if choice in {"", "s", "si", "sí", "y", "yes", "1"}:
+            return balance
+        if choice in {"r", "releer", "retry"}:
+            try:
+                balance = float(await pocket_client.get_account_balance())
+            except Exception as exc:
+                print(f"No se pudo releer saldo: {exc}")
+            if attempts >= 5:
+                print("Demasiados intentos de relectura. Usando último saldo detectado.")
+                return balance
+            continue
+        if choice in {"m", "manual"}:
+            raw_value = (await asyncio.to_thread(input, "Ingresa saldo real manual: ")).strip()
+            try:
+                manual_value = float(raw_value.replace(",", "."))
+            except ValueError:
+                print("Valor inválido. Intenta nuevamente.")
+                continue
+            if manual_value <= 0:
+                print("El saldo debe ser mayor que 0.")
+                continue
+            return manual_value
+
+        print("Opción inválida. Escribe s, r o m.")
+
+
 async def run() -> None:
     global _run_started_monotonic
     if not _blackbox.started:
@@ -213,6 +319,30 @@ async def run() -> None:
         log_level=settings.log_level,
     )
 
+    selected_account_mode = await _select_account_mode_on_start(settings.pocket_account_mode)
+    selected_execute_orders = await _select_execute_orders_on_start(
+        settings.pocket_execute_orders,
+        selected_account_mode,
+    )
+    if selected_account_mode != settings.pocket_account_mode:
+        logging.info(
+            "Modo de cuenta seleccionado para esta ejecución: %s (config default=%s)",
+            selected_account_mode,
+            settings.pocket_account_mode,
+        )
+    _blackbox.record(
+        "account_mode_selected",
+        component="main",
+        selected=selected_account_mode,
+        configured=settings.pocket_account_mode,
+    )
+    _blackbox.record(
+        "execute_orders_selected",
+        component="main",
+        selected=bool(selected_execute_orders),
+        configured=bool(settings.pocket_execute_orders),
+    )
+
     loop = asyncio.get_running_loop()
     previous_exception_handler = loop.get_exception_handler()
     loop.set_exception_handler(_build_asyncio_exception_handler(previous_exception_handler))
@@ -228,12 +358,12 @@ async def run() -> None:
     )
 
     pocket_client = PocketOptionDemoClient(
-        account_mode=settings.pocket_account_mode,
+        account_mode=selected_account_mode,
         default_asset=settings.default_asset,
         demo_url=settings.pocket_demo_url,
         profile_dir=settings.pocket_profile_dir,
         headless=settings.pocket_headless,
-        execute_orders=settings.pocket_execute_orders,
+        execute_orders=selected_execute_orders,
         max_order_amount=settings.pocket_max_order_amount,
         balance_selector=settings.pocket_balance_selector,
         asset_open_selector=settings.pocket_asset_open_selector,
@@ -251,8 +381,33 @@ async def run() -> None:
         _blackbox.record("pocket_connect_begin", component="pocket_client")
         await pocket_client.connect()
         _blackbox.record("pocket_connect_ok", component="pocket_client")
+
+        # ── Espera activa: el bot no continúa hasta que la gráfica esté visible ──
+        logging.info(
+            "Navegador abierto. Inicia sesión en Pocket Option si es necesario. "
+            "El bot continuará automáticamente cuando detecte la gráfica de trading..."
+        )
+        print(
+            "\n"
+            "╔══════════════════════════════════════════════════════════════╗\n"
+            "║  ACCIÓN REQUERIDA: Inicia sesión en Pocket Option            ║\n"
+            "║  El bot arrancará automáticamente cuando detecte la gráfica  ║\n"
+            "╚══════════════════════════════════════════════════════════════╝\n"
+        )
+        _set_run_phase("waiting_for_login")
+        _login_page = pocket_client._page
+        if _login_page is None:
+            raise RuntimeError("El navegador se abrió pero la página no está disponible.")
+        await _login_page.wait_for_selector(
+            "#put-call-buttons-chart-1",
+            timeout=0,
+            state="attached",
+        )
+        logging.info("Gráfica detectada — login completado. El bot reanuda.")
+        print("\n✓ Gráfica detectada. El bot continúa...\n")
+        _blackbox.record("chart_ready", component="pocket_client")
+
         _set_run_phase("running")
-        logging.info("Navegador Pocket Option abierto. Resuelve CAPTCHA/login en esa ventana si aparece.")
 
         # Saldo inicial real del broker para inicializar el perfil de riesgo.
         initial_balance = await pocket_client.get_account_balance()
@@ -287,11 +442,21 @@ async def run() -> None:
             pocket_client, timeout_seconds=settings.pocket_balance_wait_seconds
         )
         _blackbox.record("balance_loaded", component="pocket_client", balance=balance)
-        print(f"Saldo demo real (Pocket Option): {balance:,.2f}")
-        logging.info("Saldo demo real leido desde Pocket Option: %.2f", balance)
+        balance = await _confirm_real_balance_on_start(
+            detected_balance=balance,
+            account_mode=selected_account_mode,
+            pocket_client=pocket_client,
+        )
+
+        print(f"Saldo cuenta {selected_account_mode} (Pocket Option): {balance:,.2f}")
+        logging.info(
+            "Saldo cuenta %s leido desde Pocket Option: %.2f",
+            selected_account_mode,
+            balance,
+        )
         logging.info(
             "Modo ordenes: %s",
-            "REAL (click en broker)" if settings.pocket_execute_orders else "SIMULADO (sin click)",
+            "REAL (click en broker)" if selected_execute_orders else "SIMULADO (sin click)",
         )
 
         # ── Capital operativo dinámico (equity bands) ────────────────────────
@@ -373,18 +538,21 @@ async def run() -> None:
         from src.signals.parser import SignalParser
         from src.telegram.reader import TelegramSignalReader
 
-        logging.info("Iniciando sistema Telegram en cuenta=%s", settings.pocket_account_mode)
+        logging.info("Iniciando sistema Telegram en cuenta=%s", selected_account_mode)
         _blackbox.record("telegram_pipeline_init", component="main")
         state_manager = StateManager(dedupe_ttl_seconds=settings.message_dedupe_ttl_seconds)
         global_gale_state = GlobalGaleState(profit_target=2.0)
-        # Filtro de payout mínimo para sesión automática.
-        if runtime_payout_percent < 82.0:
-            logging.error("[SECURITY] Payout %.2f%% menor al mínimo permitido (82%%). Sesión bloqueada.", runtime_payout_percent)
-            print("[SECURITY] Payout demasiado bajo. No se puede operar la estrategia de sesión.")
-            return
+        # El payout bajo ya NO bloquea el arranque.
+        # El par puede cambiar por señal o manualmente por el usuario.
+        if runtime_payout_percent < 92.0:
+            logging.warning(
+                "[PAYOUT] Inicio con payout %.2f%% (<92%%). No se bloquea el sistema; "
+                "se permite cambio dinámico de par por señal/usuario.",
+                runtime_payout_percent,
+            )
 
         session_manager = SessionManager(
-            capital=settings.masaniello_capital,
+            capital=balance,
             n=settings.masaniello_n,
             k=settings.masaniello_k,
             payout=runtime_payout_percent / 100.0,
@@ -393,13 +561,15 @@ async def run() -> None:
         )
         logging.info(
             "[SessionConfig] capital=%.2f n=%d k=%d reinversion=%.2f stop_loss_pct=%.2f payout=%.2f%%",
-            settings.masaniello_capital,
+            balance,
             settings.masaniello_n,
             settings.masaniello_k,
             settings.masaniello_reinversion,
             settings.session_stop_loss_pct,
             runtime_payout_percent,
         )
+        # El monto inicial debe partir del saldo real del broker en esta ejecución.
+        session_manager.observe_balance(balance)
 
         session_state_path = _RUNTIME_BASE_DIR / "session_state.json"
         session_persistence = SessionStatePersistence(str(session_state_path))
@@ -436,6 +606,8 @@ async def run() -> None:
                 "[SessionPersist] Sesion pausada restaurada desde disco. "
                 "Se libera automaticamente en arranque (APP_CLEAR_STALE_STOP_ON_STARTUP=true)."
             )
+        # Prioriza el saldo real actual sobre cualquier saldo restaurado para stake de arranque.
+        session_manager.observe_balance(balance)
         session_save_task: asyncio.Task | None = None
         pending_reason: str | None = None
 
@@ -494,23 +666,7 @@ async def run() -> None:
         _payout_net = runtime_payout_percent / 100.0
         _auto_g1 = round((1.0 + _payout_net) / _payout_net, 4)
         _auto_g2 = round(_auto_g1 * _auto_g1, 4)
-        recovery_profile = RecoveryProfile(
-            g1_mult=settings.recovery_g1_mult if settings.recovery_g1_mult > 0.0 else _auto_g1,
-            g2_mult=settings.recovery_g2_mult if settings.recovery_g2_mult > 0.0 else _auto_g2,
-            max_trade_pct=settings.max_trade_pct,
-            max_total_exposure_pct=settings.max_total_exposure_pct,
-        )
-        logging.info(
-            "[RECOVERY_PROFILE] base_calc=%.2f g1_mult=%.4f g2_mult=%.4f "
-            "max_trade_pct=%.2f%% max_total_exposure_pct=%.2f%% "
-            "(g1/g2 fuente: %s)",
-            settings.calc_base_balance,
-            recovery_profile.g1_mult,
-            recovery_profile.g2_mult,
-            recovery_profile.max_trade_pct * 100,
-            recovery_profile.max_total_exposure_pct * 100,
-            ".env" if settings.recovery_g1_mult > 0.0 else "auto-payout",
-        )
+        # RecoveryProfile eliminado
         # Base inicial auxiliar para risk profile.
         _initial_calc_base = (
             equity_manager.operational_base
@@ -537,8 +693,8 @@ async def run() -> None:
             shutdown_event.set()
 
         # Si el usuario opera con click manual en broker, no debe bloquear por aprobación G2.
-        effective_g2_human_approval = bool(settings.g2_human_approval and settings.pocket_execute_orders)
-        if settings.g2_human_approval and not settings.pocket_execute_orders:
+        effective_g2_human_approval = bool(settings.g2_human_approval and selected_execute_orders)
+        if settings.g2_human_approval and not selected_execute_orders:
             logging.info(
                 "G2_HUMAN_APPROVAL ignorado en modo manual (POCKET_EXECUTE_ORDERS=false). "
                 "El motor solo esperará WIN/LOSS."
@@ -586,7 +742,6 @@ async def run() -> None:
             signal_late_tolerance_seconds=settings.signal_late_tolerance_seconds,
             global_gale_state=global_gale_state,
             session_manager=session_manager,
-            recovery_profile=recovery_profile,
             calc_base_balance=_initial_calc_base,
             event_recorder=_blackbox.record,
             equity_manager=equity_manager,
@@ -597,6 +752,7 @@ async def run() -> None:
             session_loss_brake_window_minutes=settings.masaniello_loss_brake_window_minutes,
             session_loss_brake_step=settings.masaniello_loss_brake_step,
             session_loss_brake_floor=settings.masaniello_loss_brake_floor,
+            payout_min_profitable=settings.payout_min_profitable,
         )
 
         vision_gate = VisionFilterGate.from_env(pocket_client=pocket_client)
@@ -649,6 +805,13 @@ async def run() -> None:
         )
         worker_tasks.append(_balance_monitor_task)
         logging.info("[BalanceMonitor] Tarea de monitoreo de saldo iniciada.")
+
+        _asset_payout_monitor_task = asyncio.create_task(
+            engine.start_asset_payout_monitor(poll_interval=8.0),
+            name="asset_payout_monitor",
+        )
+        worker_tasks.append(_asset_payout_monitor_task)
+        logging.info("[AssetPayoutMonitor] Tarea de monitoreo de par/payout iniciada.")
 
         # ── Manual Operation CLI (opcional) ────────────────────────────────
         if settings.manual_operations_enabled and manual_operation_tracker is not None:

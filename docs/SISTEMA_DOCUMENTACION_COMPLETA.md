@@ -368,7 +368,7 @@ Artefactos disponibles en runtime:
 - ejemplo_backtest_200_solo_g1_resumen.txt
 - ejemplo_reporte_200_solo_g1.xlsx
 
-Escenario solo_g1 documentado:
+Escenario solo_g1 documentado (histórico/backtest, no flujo operativo actual):
 
 - Se elimina gale 2.
 - Todo Win Gale 2 se trata como Loss.
