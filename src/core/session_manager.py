@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -34,6 +35,11 @@ class SessionManager:
     _gale_calc: GaleCalculator = field(init=False, repr=False)
 
     state_change_callback: Callable[["SessionManager", str], None] | None = field(default=None, repr=False)
+
+    @staticmethod
+    def _round_up_to_cents(value: float) -> float:
+        cents = math.ceil(max(0.0, float(value)) * 100.0)
+        return cents / 100.0
 
     def __post_init__(self) -> None:
         def _env_bool(name: str, default: bool) -> bool:
@@ -146,9 +152,9 @@ class SessionManager:
         self._gale_calc.saldo_actual = self.balance_actual
         self._gale_calc.payout = self.payout
         self._gale_calc.recalcular_inversion()
-        entry = max(min_order, round(self._gale_calc.inversion_actual, 2))
+        entry = max(min_order, self._round_up_to_cents(self._gale_calc.inversion_actual))
         g1 = self.peek_next_stake_if_loss(min_order=min_order)
-        max_riesgo = round(entry + g1, 2)
+        max_riesgo = self._round_up_to_cents(entry + g1)
         self._last_stakes = {"entry": entry, "g1": g1, "max_riesgo": max_riesgo}
         self._touch()
         self._notify("gale_stake_calculado")
@@ -178,6 +184,7 @@ class SessionManager:
             saldo_objetivo=float(self._gale_calc.saldo_objetivo),
             regla10_limite=float(self._gale_calc.regla10_limite),
             regla10_tolerancia_pct=float(self._gale_calc.regla10_tolerancia_pct),
+            minimo_inversion_objetivo=float(self._gale_calc.minimo_inversion_objetivo),
             mensaje=str(self._gale_calc.mensaje),
         )
 
@@ -186,7 +193,7 @@ class SessionManager:
         simulated = self._clone_gale_calc()
         for _ in range(max(0, int(losses_ahead))):
             simulated.on_perdio()
-        return max(min_order, round(simulated.inversion_actual, 2))
+        return max(min_order, self._round_up_to_cents(simulated.inversion_actual))
 
     def peek_next_stake_if_loss(self, min_order: float = 0.01) -> float:
         return self.peek_stake_after_losses(losses_ahead=1, min_order=min_order)
@@ -267,6 +274,7 @@ class SessionManager:
         result_label: str,
         balance_before: float,
         balance_after: float,
+        observed_payout: float | None = None,
     ) -> dict:
         """Reconciliación de resultado externo (manual) con saldo real del broker.
 
@@ -284,6 +292,29 @@ class SessionManager:
         self._gale_calc.saldo_actual = self.balance_actual
 
         if normalized in {"WIN", "W", "WIN DIRECTO", "G1"}:
+            if observed_payout is not None:
+                # Ajuste adaptativo del payout para acercar cierres reales al objetivo par.
+                # Se usa suavizado para evitar jitter por lecturas puntuales.
+                alpha_raw = os.getenv("APP_OBSERVED_PAYOUT_ALPHA", "0.35").strip()
+                min_profitable_raw = os.getenv("APP_PAYOUT_MIN_PROFITABLE", "0.85").strip()
+                try:
+                    alpha = float(alpha_raw)
+                except ValueError:
+                    alpha = 0.35
+                try:
+                    min_profitable = float(min_profitable_raw)
+                except ValueError:
+                    min_profitable = 0.85
+                alpha = max(0.05, min(1.0, alpha))
+                min_profitable = max(0.01, min(0.99, min_profitable))
+
+                obs = max(0.01, float(observed_payout))
+                # Filtro de plausibilidad para evitar contaminar payout con lecturas de monto erróneas.
+                # Además, no considerar payout observado por debajo del mínimo operativo.
+                if min_profitable <= obs <= 1.20:
+                    self.payout = ((1.0 - alpha) * self.payout) + (alpha * obs)
+                    self._gale_calc.payout = self.payout
+
             self._wins += 1
             self._gale_calc.perdidas = 0
             self._gale_calc.objetivo_manual = None
@@ -340,9 +371,9 @@ class SessionManager:
         self.registrar_resultado_senal("LOSS", "LOSS")
 
     def _evaluar_stop_loss_sesion(self) -> None:
-        floor = self.capital_inicial_sesion * (1.0 - self.stop_loss_pct)
-        if self.balance_actual < floor:
-            self.sesion_pausada = True
+        # Restriccion deshabilitada por decision operativa: no pausar sesion por stop loss.
+        # Si habia quedado pausada por estado previo, liberarla.
+        self.sesion_pausada = False
 
     def reset_session(
         self,

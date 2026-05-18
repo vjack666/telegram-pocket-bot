@@ -66444,3 +66444,308 @@ AUD/USD OTC - 11:50 -> VICTORIA ✅
 21 VICTORIAS ✅
 03 PÉRDIDAS ❌
 
+[17/05/2026 13:16:49] SMART SIGNALS: VICTORIA EN 1ª MARTINGALA ✅🤑
+
+[17/05/2026 13:19:27] SMART SIGNALS: 💵 USD/CAD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 13:20
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 13:25
+2️⃣ MARTINGALA A LAS 13:30
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[17/05/2026 13:40:13] SMART SIGNALS: VICTORIA EN 1ª MARTINGALA ✅🤑
+
+[17/05/2026 13:43:08] SMART SIGNALS: 💵 EUR/USD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 13:45
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 13:50
+2️⃣ MARTINGALA A LAS 13:55
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[17/05/2026 13:55:14] SMART SIGNALS: VICTORIA EN 1ª MARTINGALA ✅🤑
+
+[17/05/2026 13:58:04] SMART SIGNALS: 💵 USD/JPY OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 14:00
+🔴 ABAJO
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 14:05
+2️⃣ MARTINGALA A LAS 14:10
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[17/05/2026 14:15:14] SMART SIGNALS: ❌ PÉRDIDA
+
+[17/05/2026 14:17:05] SMART SIGNALS: 💵 USD/CHF OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 14:20
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 14:25
+2️⃣ MARTINGALA A LAS 14:30
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[17/05/2026 16:30:15] VIP TRADER A: VICTORIA EN 2ª MARTINGALA ✅🤑
+
+[17/05/2026 16:32:50] VIP TRADER A: 💵 EUR/USD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 16:35
+🔴 ABAJO
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 16:40
+2️⃣ MARTINGALA A LAS 16:45
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[17/05/2026 16:50:14] VIP TRADER A: ❌ PÉRDIDA
+
+[17/05/2026 16:51:26] VIP TRADER A: 💵 AUD/USD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 16:55
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 17:00
+2️⃣ MARTINGALA A LAS 17:05
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[17/05/2026 17:00:13] VIP TRADER A: VICTORIA DIRECTA ✅🤑
+
+[17/05/2026 17:01:28] VIP TRADER A: 💵 NZD/USD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 17:05
+🔴 ABAJO
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 17:10
+2️⃣ MARTINGALA A LAS 17:15
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[17/05/2026 17:15:14] VIP TRADER A: VICTORIA EN 1ª MARTINGALA ✅🤑
+
+[17/05/2026 17:17:38] VIP TRADER A: 💵 USD/SGD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 17:20
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 17:25
+2️⃣ MARTINGALA A LAS 17:30
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[17/05/2026 17:25:12] VIP TRADER A: VICTORIA DIRECTA ✅🤑
+
+[17/05/2026 17:25:44] VIP TRADER A: INFORME DE OPERACIONES (17/05)📊
+
+GBP/USD OTC - 00:05 -> PÉRDIDA ❌
+EUR/USD OTC - 00:25 -> VICTORIA ✅
+AUD/NZD OTC - 00:35 -> VICTORIA ✅
+USD/CAD OTC - 00:45 -> VICTORIA ✅
+NZD/USD OTC - 01:00 -> VICTORIA ✅
+USD/JPY OTC - 01:10 -> VICTORIA ✅
+USD/CAD OTC - 02:35 -> VICTORIA ✅
+AUD/USD OTC - 02:45 -> VICTORIA ✅
+USD/CHF OTC - 03:00 -> VICTORIA ✅
+USD/JPY OTC - 03:10 -> PÉRDIDA ❌
+GBP/USD OTC - 03:30 -> PÉRDIDA ❌
+EUR/USD OTC - 03:50 -> VICTORIA ✅
+AUD/USD OTC - 05:35 -> VICTORIA ✅
+EUR/USD OTC - 05:55 -> VICTORIA ✅
+GBP/USD OTC - 06:05 -> VICTORIA ✅
+USD/CAD OTC - 06:20 -> VICTORIA ✅
+AUD/CHF OTC - 06:30 -> VICTORIA ✅
+CAD/CHF OTC - 06:40 -> VICTORIA ✅
+GBP/USD OTC - 10:35 -> VICTORIA ✅
+USD/CHF OTC - 10:50 -> VICTORIA ✅
+USD/CAD OTC - 11:05 -> VICTORIA ✅
+USD/JPY OTC - 11:20 -> VICTORIA ✅
+EUR/USD OTC - 11:40 -> VICTORIA ✅
+AUD/USD OTC - 11:50 -> VICTORIA ✅
+GBP/USD OTC - 16:05 -> VICTORIA ✅
+USD/CAD OTC - 16:15 -> VICTORIA ✅
+EUR/USD OTC - 16:35 -> PÉRDIDA ❌
+AUD/USD OTC - 16:55 -> VICTORIA ✅
+NZD/USD OTC - 17:05 -> VICTORIA ✅
+USD/SGD OTC - 17:20 -> VICTORIA ✅
+
+26 VICTORIAS ✅
+04 PÉRDIDAS ❌
+
+[17/05/2026 17:37:02] SMART SIGNALS: 🚨ATENCIÓN NUEVO MIEMBRO 🚨
+
+⏰ Sesiones oficiales de trading:
+
+➡️ 1ª Sesión – 08:00
+➡️ 2ª Sesión – 13:00
+➡️ 3ª Sesión – 19:00
+
+🌍 Importante: Configura tu zona horaria a UTC -3 para seguir las señales exactamente en el mismo momento que las enviamos.
+
+🔵¿Tienes preguntas? Nuestro equipo de soporte está listo para ayudarte ➡️ HAZ CLIC AQUÍ Y HABLA CONMIGO
+
+[18/05/2026 10:32:36] VIP TRADER A: 💵 USD/CHF OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 10:35
+🔴 ABAJO
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 10:40
+2️⃣ MARTINGALA A LAS 10:45
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[18/05/2026 10:50:16] VIP TRADER A: VICTORIA EN 2ª MARTINGALA ✅🤑
+
+[18/05/2026 10:51:19] VIP TRADER A: 💵 USD/JPY OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 10:55
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 11:00
+2️⃣ MARTINGALA A LAS 11:05
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[18/05/2026 11:10:16] VIP TRADER A: VICTORIA EN 2ª MARTINGALA ✅🤑
+
+[18/05/2026 11:13:12] VIP TRADER A: 💵 AUD/USD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 11:15
+🔴 ABAJO
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 11:20
+2️⃣ MARTINGALA A LAS 11:25
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[18/05/2026 11:30:16] VIP TRADER A: VICTORIA EN 2ª MARTINGALA ✅🤑
+
+[18/05/2026 11:31:34] VIP TRADER A: 💵 NZD/USD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 11:35
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 11:40
+2️⃣ MARTINGALA A LAS 11:45
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[18/05/2026 11:50:16] VIP TRADER A: VICTORIA EN 2ª MARTINGALA ✅🤑
+
+[18/05/2026 11:52:06] VIP TRADER A: 💵 EUR/CHF OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 11:55
+🔴 ABAJO
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 12:00
+2️⃣ MARTINGALA A LAS 12:05
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[18/05/2026 12:05:14] VIP TRADER A: VICTORIA EN 1ª MARTINGALA ✅🤑
+
+[18/05/2026 12:07:07] VIP TRADER A: 💵 USD/CAD OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 12:10
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 12:15
+2️⃣ MARTINGALA A LAS 12:20
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+
+[18/05/2026 12:15:13] VIP TRADER A: VICTORIA DIRECTA ✅🤑
+
+[18/05/2026 12:16:00] VIP TRADER A: INFORME DE OPERACIONES (18/05)📊
+
+AUD/USD OTC - 00:05 -> PÉRDIDA ❌
+USD/CAD OTC - 00:25 -> VICTORIA ✅
+GBP/USD OTC - 00:40 -> VICTORIA ✅
+USD/JPY OTC - 00:50 -> VICTORIA ✅
+AUD/NZD OTC - 01:00 -> VICTORIA ✅
+NZD/USD OTC - 01:20 -> VICTORIA ✅
+USD/CAD OTC - 02:35 -> VICTORIA ✅
+GBP/USD OTC - 02:50 -> VICTORIA ✅
+EUR/USD OTC - 03:00 -> VICTORIA ✅
+USD/JPY OTC - 03:10 -> VICTORIA ✅
+AUD/NZD OTC - 03:20 -> VICTORIA ✅
+EUR/CHF OTC - 03:35 -> VICTORIA ✅
+EUR/USD OTC - 05:35 -> VICTORIA ✅
+USD/JPY OTC - 05:45 -> VICTORIA ✅
+USD/CAD OTC - 05:55 -> VICTORIA ✅
+AUD/NZD OTC - 06:10 -> VICTORIA ✅
+AUD/USD OTC - 06:20 -> VICTORIA ✅
+GBP/USD OTC - 06:35 -> VICTORIA ✅
+USD/CHF OTC - 10:35 -> VICTORIA ✅
+USD/JPY OTC - 10:55 -> VICTORIA ✅
+AUD/USD OTC - 11:15 -> VICTORIA ✅
+NZD/USD OTC - 11:35 -> VICTORIA ✅
+EUR/CHF OTC - 11:55 -> VICTORIA ✅
+USD/CAD OTC - 12:10 -> VICTORIA ✅
+
+23 VICTORIAS ✅
+01 PÉRDIDAS ❌
+
+[18/05/2026 13:10:13] SMART SIGNALS: VICTORIA DIRECTA ✅🤑
+
+[18/05/2026 13:12:50] SMART SIGNALS: 💵 USD/CHF OTC OTC
+⏳ Expiración: 5 minutos
+✅ Entrada a las 13:15
+🟢 ARRIBA
+
+Usa martingala si es necesario 👇
+
+1️⃣ MARTINGALA A LAS 13:20
+2️⃣ MARTINGALA A LAS 13:25
+
+📊 Haz clic aquí para abrir el bróker
+➡️ ¿No sabes cómo operar? Haz clic aquí
+

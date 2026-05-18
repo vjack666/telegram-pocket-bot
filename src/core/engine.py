@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -63,7 +64,7 @@ class SignalEngine:
         session_loss_brake_window_minutes: int = 180,
         session_loss_brake_step: float = 0.25,
         session_loss_brake_floor: float = 0.25,
-        payout_min_profitable: float = 0.80,
+        payout_min_profitable: float = 0.85,
     ) -> None:
         self._pocket_client = pocket_client
         self._martingale_amounts = [value for value in martingale_amounts if value > 0] or [2.0, 4.0, 10.0]
@@ -481,7 +482,8 @@ class SignalEngine:
         return max(self._session_loss_brake_floor, min(1.0, multiplier))
 
     def _apply_broker_amount_floor(self, amount: float) -> float:
-        return round(max(self._pocket_min_order_amount, float(amount)), 2)
+        adjusted = max(self._pocket_min_order_amount, float(amount))
+        return math.ceil(adjusted * 100.0) / 100.0
 
     async def _inject_next_stake_post_result(self) -> None:
         """Escribe en la caja del broker el próximo stake según Masaniello,
@@ -561,6 +563,14 @@ class SignalEngine:
             return
         if pending_manual.get("prefill_loss_written"):
             return
+
+        # Sincronizar payout dinámico del activo antes de calcular el prefill.
+        try:
+            asset_hint = str(pending_manual.get("asset_hint") or "").strip()
+            if asset_hint:
+                await self._refresh_dynamic_payout(asset_hint)
+        except Exception as exc:
+            logging.debug("[BalanceMonitor] No se pudo refrescar payout para prefill manual: %s", exc)
 
         try:
             next_if_loss = float(
@@ -669,10 +679,13 @@ class SignalEngine:
         result_label = "WIN" if result == "W" else "LOSS"
         emoji = "✅ GANADA" if result == "W" else "❌ PERDIDA"
         diff = balance_after - balance_before
+        observed_payout: float | None = None
         
         # Estimar monto si no fue pasado
         if amount is None:
             amount = abs(balance_before - balance_after) if diff < 0 else abs(diff)
+        if result == "W" and amount and amount > 0 and diff > 0:
+            observed_payout = float(diff) / float(amount)
         if asset is None:
             asset = "EURUSD OTC"  # fallback default
         if side is None:
@@ -728,6 +741,7 @@ class SignalEngine:
                 "WIN" if result == "W" else "LOSS",
                 balance_before=balance_before,
                 balance_after=balance_after,
+                observed_payout=observed_payout,
             )
             if status.get("sesion_pausada"):
                 self._alert_session_stop_loss()
@@ -759,6 +773,11 @@ class SignalEngine:
         # ─────────────────────────────────────────────────────────────────────
         if self._session_manager is not None:
             try:
+                # Refrescar payout del activo reconciliado para calcular stake con dato vigente.
+                asset_for_payout = str(asset or "").strip()
+                if asset_for_payout:
+                    await self._refresh_dynamic_payout(asset_for_payout)
+
                 next_amount = self._session_manager.get_stakes_para_senal(self._pocket_min_order_amount)["entry"]
                 await self._pocket_client.set_amount(next_amount, max_retries=2)
                 logging.info(
